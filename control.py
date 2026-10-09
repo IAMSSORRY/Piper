@@ -179,7 +179,9 @@ def serve(controller, host, port, token):
             if fn is None:
                 return self._send(404, {"ok": False, "error": "없는 경로"})
             ok, msg = fn()
-            self._send(200 if ok else 409, {"ok": ok, "message": msg, **controller.status()})
+            # 웹은 거부 이유를 error 로 읽는다 (Web src/lib/api.ts control())
+            self._send(200 if ok else 409, {"ok": ok, "message": msg, **controller.status(),
+                                            **({} if ok else {"error": msg})})
 
         def log_message(self, fmt, *args):
             log.debug("http %s", fmt % args)

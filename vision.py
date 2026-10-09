@@ -699,6 +699,7 @@ class CameraSignals:
         self.box_img = None        # 놓기 전 상자 상태 (apple_xy 때 같이 찍음)
         self.bad_xy = []           # 못 집은 사과 위치 — 다시 고르지 않는다
         self.bruises = []          # 회전 검사 멍 비율
+        self.dark_px_ratio = 0.0
         self.snap_dir = os.path.join(HERE, "snapshots")
         os.makedirs(self.snap_dir, exist_ok=True)
 
@@ -742,6 +743,8 @@ class CameraSignals:
         self.cur = a
         self.cur_others = [(b.x, b.y, b.d_m / 2) for b in apples if b is not a]
         self.top_bruise = bruise_in_circle(img, self.cfg, a.u, a.v, a.r)   # 윗면 멍 (들면 손가락이 가린다)
+        self.dark_px_ratio = a.dark_ratio                                  # 흠(아주 어두운 점) — 멍과 따로
+        self.bruises = []
         log.info("검출 %d개 → 사과 (%.3f, %.3f) 지름 %.0fmm 등급 %s (빨강 %.2f, 흠 %.2f)",
                  len(ok), a.x, a.y, a.d_m * 1000, a.grade, a.red_ratio, a.dark_ratio)
         return a.x, a.y
@@ -774,7 +777,6 @@ class CameraSignals:
         worst = max(seen + ([top] if top is not None else []))
         log.info("멍: 윗면(트레이) %s, 회전 검사 최대 %s", "-" if top is None else f"{top * 100:.1f}%",
                  f"{max(seen) * 100:.1f}%" if seen else "-")
-        self.cur.dark_ratio = worst
         thr = self.cfg["inspect"]["bruise"]["ratio_max"]
         g = self.cfg["inspect"]["bruise"].get("label", "중") if worst > thr else hi
         log.info("멍 최대 %.1f%% (기준 %.1f%%) → %s", worst * 100, thr * 100, g)
@@ -802,14 +804,32 @@ class CameraSignals:
             center = tuple(np.mean(poly, axis=0))
         return {"r": self.cur.d_m / 2, "others": self.cur_others, "walls": walls, "center": center}
 
+    def defect_extra(self):
+        """판정 근거 extra (Server README 규격): 흠·멍 비율과 기준, 하 기준, 등급 이유."""
+        a = self.cur
+        g, b = self.v["grade"], self.cfg["inspect"].get("bruise", {})
+        hi, lo = g.get("labels", ["상", "하"])
+        seen = [x for x in self.bruises if x is not None]
+        top = getattr(self, "top_bruise", None)
+        bruise = max(seen + ([top] if top is not None else [])) if (seen or top is not None) else None
+        reasons = []
+        if a.red_ratio < g["red_ratio_min"]:
+            reasons.append(f"빨강 {a.red_ratio:.2f} < {g['red_ratio_min']:.2f} → {lo}")
+        if bruise is not None and bruise > b.get("ratio_max", 1.0):
+            reasons.append(f"멍 {bruise:.3f} > {b['ratio_max']}")
+        return {"dark_ratio": round(float(self.dark_px_ratio), 3), "dark_max": g["dark_ratio_max"],
+                "bruise_ratio": None if bruise is None else round(float(bruise), 3),
+                "bruise_max": b.get("ratio_max"),
+                "red_low": g["red_ratio_min"],      # 빨강 비율이 이보다 낮으면 하 (노랑)
+                "reasons": reasons}
+
     def judge_info(self):
-        """대시보드용 판정 근거: 빨강 비율 vs 임계값, 위 카메라 픽셀 bbox."""
+        """대시보드용 판정 근거: 빨강 비율 vs 임계값, 위 카메라 픽셀 bbox, extra(흠·멍·이유)."""
         a = self.cur
         if a is None:
             return None
         return {"ratio": a.red_ratio, "threshold": self.v["grade"]["red_ratio_min"],
-                "bbox": [a.u - a.r, a.v - a.r, 2 * a.r, 2 * a.r],
-                "extra": {"dark_ratio": round(a.dark_ratio, 3), "dark_max": self.v["grade"]["dark_ratio_max"]}}
+                "bbox": [a.u - a.r, a.v - a.r, 2 * a.r, 2 * a.r], "extra": self.defect_extra()}
 
     def _box_roi(self, grade):
         bx, by = self.cfg["boxes"][grade]["xy_m"]
