@@ -181,6 +181,7 @@ class Mission:
         z_app = min(p["tray_z_m"] + p["approach_height_m"], z_lift)
         z_grasp = p["tray_z_m"] + p["grasp_height_m"]
         log.info("== pick (%.3f, %.3f)", x, y)
+        self.dash.mission("phase", phase="pick")
         self.r.transit_to(x, y, c["motion"]["transit_speed_pct"])
         self.r.grip(True, width=open_w)
         self.r.down_to(x, y, z_app, c["motion"]["transit_speed_pct"])
@@ -193,6 +194,7 @@ class Mission:
             log.warning("상승 중 사과를 놓쳤습니다")
             ok = False
         log.info("파지 %s (폭 %.1fmm)", "성공" if ok else "실패", w * 1000)
+        self.dash.mission("pick", ok=bool(ok), attempt=getattr(self, "_attempt", 0), width_mm=round(w * 1000, 1))
         return ok
 
     def inspect(self):
@@ -200,6 +202,7 @@ class Mission:
         i = self.cfg["inspect"]
         x, y = i["xy_m"]
         log.info("== inspect")
+        self.dash.mission("phase", phase="inspect")
         self.r.transit_to(x, y, self.cfg["motion"]["transit_speed_pct"])
         self.r.wait(i["wait_s"])
         g = self.sig.grade()
@@ -217,6 +220,7 @@ class Mission:
         z_rel = b["floor_z_m"] + self.tuner.release_h
         spd = self.tuner.speed(p["descend_speed_pct"])
         log.info("== place '%s' 상자 (놓는 높이 %.3fm, 하강 %.0f%%)", grade, self.tuner.release_h, spd)
+        self.dash.mission("phase", phase="place")
         self.r.transit_to(bx, by, self.cfg["motion"]["transit_speed_pct"])
         self.r.down_to(bx, by, z_rel, spd)
         if self.roll:
@@ -232,6 +236,7 @@ class Mission:
         retries = self.cfg["pick"]["retries"]
         results = []
         t0 = time.monotonic()
+        self.dash.mission("start", apple_count=n, sim=bool(getattr(self.r, "sim", False)))
         self.r.go_home()
         clear = getattr(self.sig, "needs_clear_view", False)   # 카메라: 찍기 전에 팔을 시야 밖(홈)으로
         for i in range(n):
@@ -242,8 +247,10 @@ class Mission:
                 log.info("사과 좌표 없음 → 종료")
                 break
             log.info("######## 사과 %d/%d ########", i + 1, n)
+            self.dash.mission("apple", index=i + 1, total=n)
             ok = False
             for attempt in range(1 + retries):
+                self._attempt = attempt
                 if attempt:
                     log.warning("재시도 %d/%d", attempt, retries)
                 try:
@@ -252,6 +259,7 @@ class Mission:
                     raise
                 except RobotError as e:   # 관절 해 없음·작업영역 밖 → 이 사과만 건너뛴다
                     log.error("사과 %d 건너뜀: %s", i + 1, e)
+                    self.dash.mission("skip", index=i + 1, reason=str(e))
                     if hasattr(self.sig, "mark_bad"):
                         self.sig.mark_bad()   # 다음 검출에서 이 사과는 고르지 않는다
                     self.r.go_home()
@@ -267,6 +275,7 @@ class Mission:
                 if hasattr(self.sig, "mark_bad"):
                     self.sig.mark_bad()
                 results.append((i + 1, "파지 실패", "-"))
+                self.dash.mission("skip", index=i + 1, reason="파지 실패")
                 continue
             grade = self.inspect()
             self.dash.judge(grade, getattr(self.sig, "judge_info", lambda: None)())
@@ -281,10 +290,15 @@ class Mission:
                 self.tuner.on_roll()
             else:
                 self.tuner.on_success()
+            self.dash.mission("adaptive", scale=round(self.tuner.scale, 3), release_h=round(self.tuner.release_h, 4),
+                              frozen=self.tuner.frozen, down_streak=self.tuner.down_streak)
+            self.dash.mission("phase", phase="home")
             results.append((i + 1, grade, "굴림" if rolled else "OK"))
         self.r.go_home()
 
         log.info("======== 결과 (%.1fs) ========", time.monotonic() - t0)
+        self.dash.mission("end", duration_s=round(time.monotonic() - t0, 1),
+                          results=[{"index": idx, "grade": g, "note": note} for idx, g, note in results])
         for idx, grade, note in results:
             log.info("  사과 %d: %s  %s", idx, grade, note)
         log.info("  최종 속도 배율 %.2f, 놓는 높이 %.3fm%s", self.tuner.scale, self.tuner.release_h,
@@ -447,6 +461,15 @@ def main():
             roll = open_roll_watcher(cfg)
         try:
             Mission(robot, cfg, AdaptiveTuner(cfg), signals, dash, roll).run()
+        except KeyboardInterrupt:
+            dash.mission("estop", reason="Ctrl+C 비상정지")
+            raise
+        except RobotFault as e:
+            dash.mission("estop", reason=f"로봇 고장: {e}")
+            raise
+        except (RobotError, IOError) as e:
+            dash.mission("estop", reason=f"정지: {e}")
+            raise
         finally:
             dash.flush()
             if roll:

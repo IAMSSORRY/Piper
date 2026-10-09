@@ -2,6 +2,7 @@
 
   POST /ingest/judge  {"grade", "confidence", "v_value", "threshold", "bbox", "cam", "ts"}
   POST /ingest/motion {"approach_speed", "place_height", "roll_detected", "ts"}
+  POST /ingest/mission {"event", ...필드, "ts"}  — 진행 / 실패 / 비상정지 / 적응 조정 상태
 
 전송은 백그라운드 스레드에서 한다 — 서버가 죽거나 느려도 로봇 동작은 절대 기다리지 않는다.
 토큰은 서버의 INGEST_TOKEN 과 같은 값을 환경변수(dashboard.token_env, 기본 SSORRY_TOKEN)로 준다.
@@ -62,6 +63,8 @@ class Dashboard:
             except Exception as e:
                 self.failed += 1
                 log.warning("대시보드 %s 실패: %s", path, e)
+            finally:
+                self._q.task_done()
 
     def _send(self, path, body):
         if not self.enabled:
@@ -83,6 +86,8 @@ class Dashboard:
             "bbox": [int(v) for v in info.get("bbox", [0, 0, 0, 0])],
             "cam": self.cam,
             "ts": time.time(),
+            # 등급은 빨강 비율과 흠 비율을 함께 본다 — 흠 쪽 근거도 같이 보낸다
+            **({"extra": info["extra"]} if info.get("extra") else {}),
         })
 
     def motion(self, approach_speed, place_height, rolled):
@@ -93,9 +98,14 @@ class Dashboard:
             "ts": time.time(),
         })
 
+    def mission(self, event, **fields):
+        """미션 진행 이벤트: start / apple / phase / pick / skip / adaptive / estop / end."""
+        self._send("/ingest/mission", {"event": event, **fields, "ts": time.time()})
+
     def flush(self, timeout=3.0):
         end = time.monotonic() + timeout
-        while self.enabled and not self._q.empty() and time.monotonic() < end:
+        # 큐가 비어도 마지막 하나는 전송 중일 수 있다 — 꺼낸 것까지 끝나야(task_done) 기다림을 멈춘다
+        while self.enabled and self._q.unfinished_tasks and time.monotonic() < end:
             time.sleep(0.05)
         if self.enabled:
             log.info("대시보드: 보냄 %d, 실패 %d", self.sent, self.failed)
