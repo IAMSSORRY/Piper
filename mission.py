@@ -45,7 +45,7 @@ def load_config(path):
 
 
 def grade_labels(cfg):
-    """[높은 등급, 낮은 등급] — 빨강 → 앞, 노랑 → 뒤. 지금은 상 / 하 (상자 상·중·하 중 두 칸만 쓴다)."""
+    """등급 목록, 높은 것부터. 기본 [상, 중, 하] — 칸도 상·중·하 3칸 (vision.grade_of 참고)."""
     return list(cfg["vision"]["grade"].get("labels", ["상", "중"]))
 
 
@@ -125,9 +125,10 @@ class ManualSignals:
         return self.defaults[i] if i < len(self.defaults) else None
 
     def grade(self):
-        hi, lo = self.labels
-        s = _ask(f"등급 입력 (1={hi}, 2={lo})", 20)
-        return {"1": hi, hi: hi, "2": lo, lo: lo}.get(s or "")
+        menu = ", ".join(f"{i}={g}" for i, g in enumerate(self.labels, 1))
+        s = _ask(f"등급 입력 ({menu})", 20)
+        picks = {str(i): g for i, g in enumerate(self.labels, 1)} | {g: g for g in self.labels}
+        return picks.get(s or "")
 
     def rolled(self, grade=None):
         s = _ask("굴림 있었나? (y/N)", 10)

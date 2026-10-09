@@ -197,11 +197,13 @@ class Apple:
     x: float = None   # 로봇 좌표 m (캘리브레이션 후)
     y: float = None
     d_m: float = None # 지름 m
+    bruise_ratio: float = 0.0   # 멍 비율 (사과 안쪽 원 기준)
+    wound_ratio: float = 0.0    # 상처 비율 (과육이 드러난 크림색)
+    reasons: tuple = ()         # 등급을 그렇게 매긴 이유 (화면·로그·대시보드용)
 
 
 def _masks(bgr, v):
-    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-    h, s, val = cv2.split(hsv)
+    h, s, val = _hsv(bgr)
     color = (s >= v["sat_min"]) & (val >= v["val_min"])
     r_lo, r_hi = v["red_hue"]           # 빨강은 0 근처를 감싼다: h <= r_lo or h >= r_hi
     y_lo, y_hi = v["yellow_hue"]
@@ -209,6 +211,48 @@ def _masks(bgr, v):
     yellow = color & (h > y_lo) & (h <= y_hi)
     dark = val < v["dark_val_max"]
     return red, yellow, dark
+
+
+def _hsv(bgr):
+    return cv2.split(cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV))
+
+
+def _drop_small(mask, min_px):
+    """min_px 보다 작은 덩어리는 잡음으로 지운다."""
+    m = mask.astype(np.uint8)
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+    keep = np.zeros(n, bool)
+    keep[1:] = stats[1:, cv2.CC_STAT_AREA] >= min_px
+    return keep[lab]
+
+
+def defects(hsv, cx, cy, r, v):
+    """사과 하나의 멍·상처 비율. 사과 안쪽 원(inner_frac)만 본다 — 구의 가장자리는 원래 어두워 멍으로 오인된다.
+
+    - 멍: 그 사과 색 영역의 밝기 중앙값보다 bruise_val_drop 배 넘게 어둡고(흠보다는 밝은) 빨강~갈색 영역
+    - 상처: 채도가 낮고 밝은 크림색(과육) 영역. 반사광(아주 밝고 거의 무채색인 점)은 뺀다
+    둘 다 min_blob_px 보다 작은 덩어리는 잡음으로 본다. 반환: (멍 비율, 상처 비율)
+    """
+    d = v.get("defects") or {}
+    h, s, val = hsv
+    inner = np.zeros(h.shape, np.uint8)
+    cv2.circle(inner, (int(cx), int(cy)), max(1, int(r * d.get("inner_frac", 0.7))), 1, -1)
+    inner = inner.astype(bool)
+    area = max(1, int(inner.sum()))
+    skin = inner & (s >= v["sat_min"]) & (val >= v["val_min"])
+    if not skin.any():
+        return 0.0, 0.0
+    med_v = float(np.median(val[skin]))
+    brownish = (h <= d.get("bruise_hue_max", 30)) | (h >= v["red_hue"][1])
+    bruise = (inner & brownish & (val >= v["dark_val_max"]) & (s >= d.get("bruise_sat_min", 40))
+              & (val < med_v * d.get("bruise_val_drop", 0.65)))
+    w_lo, w_hi = d.get("wound_hue", [10, 40])
+    glare = (val >= d.get("glare_val_min", 235)) & (s < d.get("glare_sat_max", 25))   # 아주 밝고 거의 무채색
+    wound = (inner & (s <= d.get("wound_sat_max", 80)) & (val >= d.get("wound_val_min", 120))
+             & ~glare & (h >= w_lo) & (h <= w_hi))
+    min_px = d.get("min_blob_px", 30)
+    return (float(_drop_small(bruise, min_px).sum()) / area,
+            float(_drop_small(wound, min_px).sum()) / area)
 
 
 def _roi_mask(shape, poly):
@@ -222,6 +266,7 @@ def detect_apples(bgr, cfg, roi=None):
     v = cfg["vision"]
     bgr = color_correct(bgr, cfg)
     red, yellow, dark = _masks(bgr, v)
+    hsv = _hsv(bgr)
     mask = ((red | yellow).astype(np.uint8) * 255)
     roi = v["tray_roi_px"] if roi is None else roi
     mask &= _roi_mask(bgr.shape, roi)
@@ -254,15 +299,60 @@ def detect_apples(bgr, cfg, roi=None):
         n_red, n_yel = int((red & c).sum()), int((yellow & c).sum())
         red_ratio = n_red / max(1, n_red + n_yel)
         dark_ratio = float((dark & c).sum()) / max(1, int(c.sum()))
-        apples.append(Apple(float(cx), float(cy), r, red_ratio, dark_ratio, grade_of(red_ratio, dark_ratio, v)))
+        bruise_ratio, wound_ratio = defects(hsv, cx, cy, r, v)
+        grade, reasons = grade_of(red_ratio, dark_ratio, v, bruise_ratio, wound_ratio)
+        apples.append(Apple(float(cx), float(cy), r, red_ratio, dark_ratio, grade,
+                            bruise_ratio=bruise_ratio, wound_ratio=wound_ratio, reasons=tuple(reasons)))
     return apples
 
 
-def grade_of(red_ratio, dark_ratio, v):
+def grade_of(red_ratio, dark_ratio, v, bruise_ratio=0.0, wound_ratio=0.0):
+    """등급과 그 이유. labels 가 [상, 중, 하] 면 3단계:
+
+    - 하: 상처·멍·흠 중 하나라도 '하 기준'을 넘거나, 빨강 비율이 red_ratio_low 미만
+    - 상: 빨강 비율 >= red_ratio_min 이고 흠·멍·상처가 모두 '상 기준' 이하
+    - 중: 나머지
+    labels 가 두 개면 예전처럼 [높은 등급, 낮은 등급] (상 조건이 아니면 낮은 등급).
+    """
     g = v["grade"]
-    hi, lo = g.get("labels", ["상", "중"])
-    top = red_ratio >= g["red_ratio_min"] and dark_ratio <= g["dark_ratio_max"]
-    return hi if top else lo
+    labels = list(g.get("labels", ["상", "중"]))
+    # (이름, 값, 상 기준(이하), 하 기준(초과))
+    checks = [
+        ("흠", dark_ratio, g["dark_ratio_max"], g.get("dark_ratio_low")),
+        ("멍", bruise_ratio, g.get("bruise_ratio_max"), g.get("bruise_ratio_low")),
+        ("상처", wound_ratio, g.get("wound_ratio_max"), g.get("wound_ratio_low")),
+    ]
+    low, mid = [], []
+    for name, val, top_max, low_max in checks:
+        if low_max is not None and val > low_max:
+            low.append(f"{name} {val:.3f} > {low_max}")
+        elif top_max is not None and val > top_max:
+            mid.append(f"{name} {val:.3f} > {top_max}")
+    red_low = g.get("red_ratio_low")
+    if red_low is not None and red_ratio < red_low:
+        low.append(f"빨강 {red_ratio:.2f} < {red_low}")
+    elif red_ratio < g["red_ratio_min"]:
+        mid.append(f"빨강 {red_ratio:.2f} < {g['red_ratio_min']}")
+
+    if len(labels) >= 3:
+        hi, md, lo = labels[:3]
+        if low:
+            return lo, low
+        return (md, mid) if mid else (hi, [])
+    hi, lo = labels[:2]
+    return (lo, low + mid) if (low or mid) else (hi, [])
+
+
+def defect_extra(a, g):
+    """대시보드 판정 근거 extra: 흠·멍·상처 비율과 기준, 등급 이유."""
+    out = {"dark_ratio": round(a.dark_ratio, 3), "dark_max": g["dark_ratio_max"],
+           "bruise_ratio": round(a.bruise_ratio, 3), "wound_ratio": round(a.wound_ratio, 3),
+           "reasons": list(a.reasons)}
+    for key in ("dark_ratio_low", "bruise_ratio_max", "bruise_ratio_low", "wound_ratio_max", "wound_ratio_low",
+                "red_ratio_low"):
+        if g.get(key) is not None:
+            out[key.replace("_ratio", "")] = g[key]
+    return out
 
 
 def draw(bgr, apples, cfg, calib=None, extra=None):
@@ -271,10 +361,11 @@ def draw(bgr, apples, cfg, calib=None, extra=None):
     cv2.rectangle(out, (x, y), (x + w, y + h), (200, 200, 200), 1)
     cv2.polylines(out, [np.array(cfg["vision"]["tray_roi_px"], np.int32)], True, (255, 255, 0), 1)
     for i, a in enumerate(apples):
-        col = (0, 0, 255) if a.grade == "상" else (0, 200, 255)   # 빨강 = 높은 등급, 노랑 = 낮은 등급
+        col = {"상": (0, 0, 255), "중": (0, 200, 255), "하": (200, 120, 200)}.get(a.grade, (255, 255, 255))
         cv2.circle(out, (int(a.u), int(a.v)), int(a.r), col, 2)
         cv2.drawMarker(out, (int(a.u), int(a.v)), col, cv2.MARKER_CROSS, 12, 2)
-        t = f"{i} {'A' if a.grade == '상' else ('C' if a.grade == '하' else 'B')} r{a.red_ratio:.2f} d{a.dark_ratio:.2f}"
+        t = (f"{i} {'A' if a.grade == '상' else ('C' if a.grade == '하' else 'B')} r{a.red_ratio:.2f} d{a.dark_ratio:.2f}"
+             f" b{a.bruise_ratio:.2f} w{a.wound_ratio:.2f}")
         if a.x is not None:
             t2 = f"({a.x:.3f},{a.y:.3f}) D{a.d_m * 1000:.0f}mm"
             cv2.putText(out, t2, (int(a.u - a.r), int(a.v + a.r + 30)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
@@ -611,8 +702,9 @@ class CameraSignals:
             log.warning("사과 지름 %.0fmm > 그리퍼 열림 %.0fmm — 못 집을 수 있음", a.d_m * 1000, gw * 1000)
         self.cur = a
         self.cur_others = [(b.x, b.y, b.d_m / 2) for b in apples if b is not a]
-        log.info("검출 %d개 → 사과 (%.3f, %.3f) 지름 %.0fmm 등급 %s (빨강 %.2f, 흠 %.2f)",
-                 len(ok), a.x, a.y, a.d_m * 1000, a.grade, a.red_ratio, a.dark_ratio)
+        log.info("검출 %d개 → 사과 (%.3f, %.3f) 지름 %.0fmm 등급 %s (빨강 %.2f, 흠 %.2f, 멍 %.3f, 상처 %.3f)%s",
+                 len(ok), a.x, a.y, a.d_m * 1000, a.grade, a.red_ratio, a.dark_ratio,
+                 a.bruise_ratio, a.wound_ratio, f" — {', '.join(a.reasons)}" if a.reasons else "")
         return a.x, a.y
 
     def grade(self):
@@ -644,7 +736,7 @@ class CameraSignals:
             return None
         return {"ratio": a.red_ratio, "threshold": self.v["grade"]["red_ratio_min"],
                 "bbox": [a.u - a.r, a.v - a.r, 2 * a.r, 2 * a.r],
-                "extra": {"dark_ratio": round(a.dark_ratio, 3), "dark_max": self.v["grade"]["dark_ratio_max"]}}
+                "extra": defect_extra(a, self.v["grade"])}
 
     def _box_roi(self, grade):
         bx, by = self.cfg["boxes"][grade]["xy_m"]
@@ -720,7 +812,9 @@ def main():
             apply_calib(apples, calib)
         for i, a in enumerate(apples):
             xy = f"  xy=({a.x:.3f}, {a.y:.3f}) m  지름 {a.d_m * 1000:.0f}mm" if calib else ""
-            print(f"  {i}: px=({a.u:.0f},{a.v:.0f}) r={a.r:.0f}  빨강 {a.red_ratio:.2f} 흠 {a.dark_ratio:.2f} → {a.grade}{xy}")
+            why = f"  ({', '.join(a.reasons)})" if a.reasons else ""
+            print(f"  {i}: px=({a.u:.0f},{a.v:.0f}) r={a.r:.0f}  빨강 {a.red_ratio:.2f} 흠 {a.dark_ratio:.2f}"
+                  f" 멍 {a.bruise_ratio:.3f} 상처 {a.wound_ratio:.3f} → {a.grade}{why}{xy}")
         return draw(img, apples, cfg, calib, [f"{len(apples)} apples"])
 
     if args.roll_test:
