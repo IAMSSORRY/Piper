@@ -502,41 +502,78 @@ class Robot:
             raise RobotError(f"관절 해 없음: 손가락끝 ({x:.3f},{y:.3f},{ztip:.3f}) — 너무 멀거나 높음")
         return list(r[0]), r[1]
 
-    def _min_tip_z(self, qa, qb, n=12):
+    def _path_pts(self, q):
+        """관절 자세 → 팔 각 마디 + 손가락끝 위치들 (충돌 점검용)."""
         import ik
-        zs = []
+        pts = [(p[0] / 1000.0, p[1] / 1000.0, p[2] / 1000.0) for p in ik._FK().CalFK(list(q))]
+        tip = ik.fk_tip(q, self.tool_len)[0]
+        return pts + [tuple(tip)]
+
+    def _seg_check(self, qa, qb, n=14):
+        """qa→qb 관절 보간을 점검: (손가락끝 최저 z, 금지 구역 침범 여부)."""
+        import ik
+        keep = self.cfg.get("keepout_xy_m") or []
+        zmin, hit = 9.0, None
         for k in range(n + 1):
             q = [a + (b - a) * k / n for a, b in zip(qa, qb)]
-            zs.append(ik.fk_tip(q, self.tool_len)[0][2])
-        return min(zs)
+            zmin = min(zmin, ik.fk_tip(q, self.tool_len)[0][2])
+            for (px, py, pz) in self._path_pts(q):
+                for kx, ky, kr in keep:
+                    if math.hypot(px - kx, py - ky) < kr:
+                        hit = (kx, ky)
+        return zmin, hit
 
     def _tip_xy(self, q):
         import ik
         return ik.fk_tip(q, self.tool_len)[0][:2]
 
     def _plan(self, qa, qb, depth=0):
-        """qa→qb 관절 보간 중 손가락끝이 이동 높이 밑으로 처지면 가운데에 경유점을 넣는다."""
-        if depth >= 4 or self._min_tip_z(qa, qb) >= self.transit_tip_z - 0.01:
+        """qa→qb 사이에 손가락끝이 이동 높이 밑으로 처지거나 금지 구역(삼각대 등)에 닿으면 가운데 경유점을 넣는다.
+        금지 구역 때문이면 경유점을 베이스 쪽(transit_inner_r_m)으로 당긴다."""
+        zmin, hit = self._seg_check(qa, qb)
+        if zmin >= self.transit_tip_z - 0.01 and hit is None:
+            return [qb]
+        if depth >= 4:
+            if hit is not None:
+                raise RobotError(f"이동 경로가 금지 구역 {hit} 에 닿습니다 — 경로를 못 찾음 (keepout_xy_m 확인)")
             return [qb]
         (xa, ya), (xb, yb) = self._tip_xy(qa), self._tip_xy(qb)
-        qm, _ = self._ik((xa + xb) / 2, (ya + yb) / 2, self.transit_tip_z)
+        mx, my = (xa + xb) / 2, (ya + yb) / 2
+        if hit is not None:
+            r_in = float(self.cfg.get("transit_inner_r_m", 0.28))
+            r = math.hypot(mx, my)
+            if r > r_in:
+                mx, my = mx * r_in / r, my * r_in / r
+        qm, _ = self._ik(mx, my, self.transit_tip_z)
         return self._plan(qa, qm, depth + 1) + self._plan(qm, qb, depth + 1)
 
+    def _inner(self, x, y):
+        """먼 곳은 같은 방향 안쪽 경유점 (팔이 크게 휘돌지 않게)."""
+        r = math.hypot(x, y)
+        r_far, r_in = float(self.cfg.get("transit_far_r_m", 0.36)), float(self.cfg.get("transit_inner_r_m", 0.28))
+        return (x * r_in / r, y * r_in / r) if r > r_far else None
+
     def transit_to(self, x, y, speed_pct):
-        """이동 높이(손가락끝 transit_tip_z_m)에서 (x, y) 위로. 제자리 상승 → 경유점 → 목표. 도착까지 블로킹."""
+        """이동 높이(손가락끝 transit_tip_z_m)에서 (x, y) 위로. 제자리 상승 → (먼 곳이면 안쪽 경유) → 목표.
+        구간마다 처짐·금지 구역을 순기구학으로 점검. 도착까지 블로킹."""
         r = math.hypot(x, y)
         r_min = float(self.cfg.get("transit_min_r_m", 0.16))
         if 1e-6 < r < r_min:   # 베이스 바로 위 높은 곳은 많이 기울어진다 → 바깥쪽에 멈추고 down_to 가 비스듬히 내려간다
             x, y = x * r_min / r, y * r_min / r
-        self._check_ws(x, y, self.transit_tip_z + self.tool_len * 0.9)
+        self._check_ws(x, y, self.transit_tip_z)   # 도달 여부는 IK 가 판단 (3D 반경 점검은 손가락끝 기준)
         q0 = self.current_joints()
         x0, y0 = self._tip_xy(q0)
         r0 = math.hypot(x0, y0)
         if 1e-6 < r0 < r_min:   # 베이스 가까이서는 바깥쪽으로 비켜서 올라간다
             x0, y0 = x0 * r_min / r0, y0 * r_min / r0
         q_up, t_up = self._ik(x0, y0, self.transit_tip_z)
-        q_goal, t_goal = self._ik(x, y, self.transit_tip_z)
-        path = [q_up] + self._plan(q_up, q_goal)
+        stops = [p for p in (self._inner(x0, y0), self._inner(x, y)) if p is not None] + [(x, y)]
+        path, q_prev = [q_up], q_up
+        for sx, sy in stops:
+            q_s, t_goal = self._ik(sx, sy, self.transit_tip_z)
+            seg = self._plan(q_prev, q_s)
+            path += seg
+            q_prev = q_s
         log.info("transit_to (%.3f, %.3f) 손가락끝 z %.2f, 경유 %d점, 기울기 %.0f°→%.0f°",
                  x, y, self.transit_tip_z, len(path), t_up, t_goal)
         for q in path:
