@@ -11,6 +11,7 @@
 실행 중 Ctrl+C = 비상정지.
 """
 import argparse
+import itertools
 import logging
 import math
 import os
@@ -42,6 +43,30 @@ def load_config(path):
         if g not in cfg["boxes"]:
             sys.exit(f"config boxes 에 '{g}' 구역이 없습니다")
     return cfg
+
+
+def resolve_apple_count(cfg, arg=None):
+    """미션 사과 개수. --apples > 환경변수 MISSION_APPLE_COUNT > config mission.apple_count.
+
+    0 / all / auto (또는 config 의 null) 이면 None = 트레이에 사과가 없을 때까지 계속.
+    """
+    for src, raw in (("--apples", arg), ("MISSION_APPLE_COUNT", os.environ.get("MISSION_APPLE_COUNT")),
+                     ("config mission.apple_count", cfg.get("mission", {}).get("apple_count"))):
+        if raw is None or str(raw).strip() == "":
+            continue
+        text = str(raw).strip().lower()
+        if text in ("0", "all", "auto", "none", "null"):
+            log.info("사과 개수: 없을 때까지 [%s]", src)
+            return None
+        try:
+            n = int(text)
+        except ValueError:
+            raise SystemExit(f"사과 개수가 숫자가 아닙니다: {src}={raw!r} (숫자, 또는 0/all = 없을 때까지)")
+        if n < 0:
+            raise SystemExit(f"사과 개수는 0 이상이어야 합니다: {src}={raw!r}")
+        log.info("사과 개수: %d [%s]", n, src)
+        return n
+    return None
 
 
 def grade_labels(cfg):
@@ -344,7 +369,7 @@ class Mission:
         self.r.down_to(bx, by, z_lift, p["lift_speed_pct"])
 
     def run(self):
-        n = self.cfg["mission"]["apple_count"]
+        n = self.cfg["mission"].get("apple_count")   # None = 사과가 없을 때까지 (resolve_apple_count)
         retries = self.cfg["pick"]["retries"]
         results = []
         t0 = time.monotonic()
@@ -364,13 +389,13 @@ class Mission:
             self.dash.mission("box", info=info, **{g: [round(x, 3), round(y, 3)] for g, (x, y) in res.items()})
         self.r.go_home()
         clear = getattr(self.sig, "needs_clear_view", False)   # 카메라: 찍기 전에 팔을 시야 밖(홈)으로
-        for i in range(n):
+        for i in (range(n) if n is not None else itertools.count()):
             # 홈 복귀 없음: 놓고 올라온 팔은 상자 위라 트레이를 가리지 않는다 (사과 하나에 ~2초)
             xy = self.sig.apple_xy(i)
             if xy is None:
                 log.info("사과 좌표 없음 → 종료")
                 break
-            log.info("######## 사과 %d/%d ########", i + 1, n)
+            log.info("######## 사과 %d/%s ########", i + 1, n if n is not None else "?")
             self.dash.mission("apple", index=i + 1, total=n)
             ok = False
             self._nudges = 0
@@ -553,6 +578,8 @@ def main():
     ap.add_argument("--speed", type=float, default=15, help="--dry-run 속도 %% (기본 15)")
     ap.add_argument("--signals", choices=["sim", "manual", "camera"],
                     help="신호 소스 (기본: SIM이면 sim, 아니면 calib.yaml 있으면 camera, 없으면 manual)")
+    ap.add_argument("--apples", metavar="N",
+                    help="사과 개수 (기본: 환경변수 MISSION_APPLE_COUNT, 없으면 config). 0/all = 트레이가 빌 때까지")
     ap.add_argument("--dashboard", choices=["on", "off"],
                     help="대시보드 전송 (기본: config dashboard.enabled, 단 SIM 이면 off — 실제 통계 오염 방지)")
     ap.add_argument("-v", "--verbose", action="store_true", help="SDK 호출까지 로그")
@@ -598,6 +625,7 @@ def main():
         if not sim:
             from vision import open_roll_watcher
             roll = open_roll_watcher(cfg)
+        cfg["mission"]["apple_count"] = resolve_apple_count(cfg, args.apples)
         try:
             Mission(robot, cfg, AdaptiveTuner(cfg), signals, dash, roll).run()
         except KeyboardInterrupt:
