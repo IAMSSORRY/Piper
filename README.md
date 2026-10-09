@@ -82,3 +82,22 @@ $PY mission.py --signals manual    # 카메라 없이: 좌표·등급을 터미�
 | 모션 | `approach_speed` = 하강 속도 배율, `place_height` = 놓는 높이 m, `roll_detected` |
 
 SIM 에서는 전송이 꺼진다 (`--dashboard on` 으로 강제).
+
+## 원격 제어 (프론트에서 시작·비상정지·해제)
+
+```bash
+SSORRY_TOKEN=<토큰> ~/.venvs/piper-daemons/bin/python mission.py --serve     # 0.0.0.0:8765 (config control)
+```
+
+| 요청 | 동작 |
+|---|---|
+| `GET /status` | `{state, error, index, placed, results}` — state: idle / running / estopped / error / done |
+| `POST /start` `{"apples": 5}` | 미션 시작 (`"all"` = 트레이가 빌 때까지, 생략 = config) |
+| `POST /estop` | 비상정지 |
+| `POST /resume` | 비상정지(또는 오류 정지) 해제 → 모터 enable → **멈춘 사과부터 이어서** (칸별 개수·속도 조정 유지). 사과를 쥔 채 멈췄으면 트레이 가운데에 내려놓고 다시 찍는다 |
+| `POST /stop` | 지금 사과까지만 하고 멈춤 |
+
+- 헤더 `Authorization: Bearer <SSORRY_TOKEN>` (대시보드 ingest 토큰과 같은 값)
+- PIPER Studio 비상정지·힘 이상 정지로 멈춰도 state 가 estopped / error 가 되고 `/resume` 으로 이어진다
+- ⚠ 비상정지 해제(SDK `EmergencyStop(0x02)`) 순간 모터 전원이 잠깐 빠져 팔이 처질 수 있다 — 프론트에서 확인창을 띄울 것
+- 상태 변화는 대시보드에 `mission` 이벤트 `{"event": "control", "state": ..., "error": ...}` 로도 간다

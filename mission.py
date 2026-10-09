@@ -200,6 +200,7 @@ class Mission:
         self.r, self.cfg, self.tuner, self.sig = robot, cfg, tuner, signals
         self.dash = dash or Dashboard({})
         self.placed = {}      # 칸별 놓은 개수
+        self.results, self.next_i, self.stop_requested, self.t0 = [], 0, False, time.monotonic()
         self.last_drop = None  # 운반 중 낙하 표시
         self.roll = roll      # 굴림 카메라 (vision.BoxRollWatcher). 없으면 signals.rolled()
 
@@ -343,15 +344,23 @@ class Mission:
         log.info("'%s' 칸 %d번째 자리 (%.3f, %.3f)%s", grade, k + 1, bx, by,
                  " — 위에 얹음 +%.0fmm" % (slot["dz_m"] * 1000) if slot["dz_m"] else "")
         z_lift = self.r.lift_z(bx, by)
-        z_rel = b["floor_z_m"] + self.tuner.release_h + slot["dz_m"]
+        z_floor = b["floor_z_m"] + self.tuner.release_h       # 바닥에 놓을 때 높이
+        z_expect = z_floor + slot["dz_m"]                     # 개수로 짐작한 높이 (빠르게 내려갈 한계로만 쓴다)
         spd = self.tuner.speed(p["descend_speed_pct"])
         log.info("== place '%s' 상자 (놓는 높이 %.3fm, 하강 %.0f%%)", grade, self.tuner.release_h, spd)
         self.dash.mission("phase", phase="place")
         self.r.transit_to(bx, by, self.cfg["motion"]["transit_speed_pct"])
-        slow = p.get("slow_zone_m", 0.04)               # 놓기 직전 이 구간만 느리게
-        if z_lift > z_rel + slow:
-            self.r.down_to(bx, by, z_rel + slow, self.cfg["motion"]["approach_speed_pct"])
-        self.r.down_to(bx, by, z_rel, spd)
+        slow = p.get("slow_zone_m", 0.04)
+        z_fast = z_expect + slow + p.get("contact_margin_m", 0.03)   # 여기까지 빠르게
+        if self.r.current_pose()[2] > z_fast + 0.005:
+            self.r.down_to(bx, by, z_fast, self.cfg["motion"]["approach_speed_pct"])
+        # 바닥까지 천천히 내려가다 닿으면(아래 사과든 바닥이든) 멈춘다 — 개수로 높이를 짐작하면 사과가 굴러 나갔을 때 공중에서 떨어뜨린다
+        how, z_here = self.r.guarded_down(bx, by, z_floor, spd, p.get("contact_nm", 0.5))
+        if how == "contact":
+            self.r.down_to(bx, by, z_here + p.get("contact_backoff_m", 0.002), spd)   # 살짝 떼서 누르는 힘 빼기
+        log.info("놓는 곳: %s (플랜지 z %.3f, 바닥 기준 +%.0fmm)", "닿은 곳" if how == "contact" else "바닥 높이",
+                 z_here, (z_here - z_floor) * 1000)
+        z_lift = max(z_lift, z_here + 0.05)                   # 쌓인 위에서는 그보다 위로 올라간다
         held = self.r.gripper_width()
         if held < self.cfg["gripper"]["min_grasp_width_m"]:   # 운반 중에 떨어뜨렸다
             log.error("낙하: 상자에 가는 동안 사과를 놓쳤습니다 (그리퍼 폭 %.0fmm)", held * 1000)
@@ -368,11 +377,34 @@ class Mission:
             self.roll.stop()                 # 팔이 올라가기 전에 관찰 끝
         self.r.down_to(bx, by, z_lift, p["lift_speed_pct"])
 
-    def run(self):
+    def recover_held(self):
+        """이어하기 전: 사과를 쥔 채 멈췄으면 트레이 가운데에 살살 내려놓는다 (다시 찍어서 처음부터 집는다)."""
+        if self.r.gripper_width() < self.cfg["gripper"]["min_grasp_width_m"]:
+            self.r.grip(True)
+            return
+        p = self.cfg["pick"]
+        (x1, y1), (x2, y2) = self.cfg["calibration"]["corner1_xy_m"], self.cfg["calibration"]["corner2_xy_m"]
+        tx, ty = (x1 + x2) / 2, (y1 + y2) / 2
+        log.warning("사과를 쥔 채 멈췄었다 → 트레이 가운데 (%.3f, %.3f) 에 내려놓고 다시 시작", tx, ty)
+        self.r.transit_to(tx, ty, self.cfg["motion"]["transit_speed_pct"])
+        how, z = self.r.guarded_down(tx, ty, p["tray_z_m"] + p["grasp_height_m"] + 0.005,
+                                     p["descend_speed_pct"], self.cfg["place"].get("contact_nm", 0.5))
+        self.r.grip(True, width=self.r.gripper_width() + 0.012)
+        self.r.down_to(tx, ty, max(self.r.lift_z(tx, ty), z + 0.05), p["lift_speed_pct"])
+        self.r.jaw_yaw = None
+
+    def run(self, resume=False):
+        """미션. resume=True 면 멈춘 사과부터 이어서 (칸별 개수·속도 조정·결과 유지)."""
         n = self.cfg["mission"].get("apple_count")   # None = 사과가 없을 때까지 (resolve_apple_count)
         retries = self.cfg["pick"]["retries"]
-        results = []
-        t0 = time.monotonic()
+        if resume:
+            log.info("======== 이어서 시작: 사과 %d번째부터 ========", self.next_i + 1)
+            self.dash.mission("resume", index=self.next_i + 1)
+            self.recover_held()
+            self.r.go_home()
+            return self._loop(n, retries)
+        self.results, self.next_i, self.stop_requested = [], 0, False
+        self.t0 = time.monotonic()
         self.dash.mission("start", apple_count=n, sim=bool(getattr(self.r, "sim", False)))
         if hasattr(self.sig, "locate_boxes"):   # 상자 위치를 사진으로 확인 (팔을 트레이 위로 비켜서)
             vx, vy = self.cfg["vision"]["box"]["view_xy_m"]
@@ -388,8 +420,16 @@ class Mission:
                      ", ".join(f"{g} ({x:.3f}, {y:.3f})" for g, (x, y) in res.items()))
             self.dash.mission("box", info=info, **{g: [round(x, 3), round(y, 3)] for g, (x, y) in res.items()})
         self.r.go_home()
+        return self._loop(n, retries)
+
+    def _loop(self, n, retries):
+        results, t0 = self.results, self.t0
         clear = getattr(self.sig, "needs_clear_view", False)   # 카메라: 찍기 전에 팔을 시야 밖(홈)으로
-        for i in (range(n) if n is not None else itertools.count()):
+        for i in (range(self.next_i, n) if n is not None else itertools.count(self.next_i)):
+            self.next_i = i                      # 여기서 멈추면 이 사과부터 다시
+            if self.stop_requested:
+                log.info("멈춤 요청 → 여기까지")
+                break
             # 홈 복귀 없음: 놓고 올라온 팔은 상자 위라 트레이를 가리지 않는다 (사과 하나에 ~2초)
             xy = self.sig.apple_xy(i)
             if xy is None:
@@ -582,6 +622,9 @@ def main():
                     help="사과 개수 (기본: 환경변수 MISSION_APPLE_COUNT, 없으면 config). 0/all = 트레이가 빌 때까지")
     ap.add_argument("--dashboard", choices=["on", "off"],
                     help="대시보드 전송 (기본: config dashboard.enabled, 단 SIM 이면 off — 실제 통계 오염 방지)")
+    ap.add_argument("--serve", action="store_true",
+                    help="원격 제어 서버로 대기 (프론트에서 시작·비상정지·해제·멈춤) — control.py")
+    ap.add_argument("--port", type=int, default=None, help="--serve 포트 (기본 config control.port)")
     ap.add_argument("-v", "--verbose", action="store_true", help="SDK 호출까지 로그")
     args = ap.parse_args()
 
@@ -626,6 +669,18 @@ def main():
             from vision import open_roll_watcher
             roll = open_roll_watcher(cfg)
         cfg["mission"]["apple_count"] = resolve_apple_count(cfg, args.apples)
+        if args.serve:
+            from control import Controller, serve
+            ctl = Controller(robot, cfg, lambda: Mission(robot, cfg, AdaptiveTuner(cfg), signals, dash, roll), dash)
+            cc = cfg.get("control", {})
+            tok = os.environ.get(cfg.get("dashboard", {}).get("token_env", "SSORRY_TOKEN"), "")
+            try:
+                serve(ctl, cc.get("host", "0.0.0.0"), args.port or cc.get("port", 8765), tok)
+            finally:
+                dash.flush()
+                if roll:
+                    roll.close()
+            return 0
         try:
             Mission(robot, cfg, AdaptiveTuner(cfg), signals, dash, roll).run()
         except KeyboardInterrupt:

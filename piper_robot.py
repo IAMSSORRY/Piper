@@ -66,6 +66,10 @@ class RobotFault(RobotError):
     pass
 
 
+class _Contact(Exception):
+    """guarded_down 안에서만 쓰는 신호: 닿았다."""
+
+
 class ForceStop(RobotError):
     """관절 부하가 갑자기 튐 (어딘가에 닿았다) → 그 자리 정지."""
     pass
@@ -572,6 +576,50 @@ class Robot:
                                                  x, y, tip, tilt)
         self.move_joints(q, speed_pct)
 
+    def guarded_down(self, x, y, z_flange, speed_pct, thr_nm, skip_s=0.35, persist_s=0.06):
+        """(x, y) 에서 z_flange 까지 천천히 내려가다가 '닿으면'(관절2·3 부하가 내려가는 동안의 평소 값에서
+        thr_nm 넘게 바뀌면) 그 자리에 멈춘다. 반환 ('contact' | 'floor', 멈춘 플랜지 z).
+        사과를 쌓을 때: 아래 사과(또는 바닥)에 닿은 곳에서 놓는다 — 개수로 높이를 짐작하지 않는다."""
+        import ik
+        q, _ = self._ik(x, y, z_flange - self.tool_len)
+        if self.jaw_yaw is not None:
+            q = self._q6_for_jaw(q, self.jaw_yaw, ref=self.current_joints()[5])
+        t0 = time.monotonic()
+        base, since = None, None
+        samples = []
+
+        def tick():
+            nonlocal base, since
+            now = time.monotonic()
+            e = self._efforts()
+            if now - t0 < skip_s:          # 출발 가속 구간은 안 본다
+                return
+            if base is None:
+                samples.append(e)
+                if len(samples) >= 5:      # 등속 하강 중 평소 부하
+                    base = [sorted(c)[len(c) // 2] for c in zip(*samples)]
+                return
+            dev = max(abs(e[j] - base[j]) for j in (1, 2))
+            if dev > thr_nm:
+                since = since or now
+                if now - since >= persist_s:
+                    raise _Contact()
+            else:
+                since = None
+
+        fm = self.fm_on
+        self.fm_on = False                 # 접촉 감지가 대신한다 (같은 신호로 비상정지하면 안 된다)
+        try:
+            self.move_joints(q, speed_pct, tick=tick)
+            return "floor", self.current_pose()[2]
+        except _Contact:
+            self.hold()
+            z = self.current_pose()[2]
+            log.info("닿음: 플랜지 z %.3f (목표 %.3f 보다 %.0fmm 위)", z, z_flange, (z - z_flange) * 1000)
+            return "contact", z
+        finally:
+            self.fm_on = fm
+
     # ---------- 높은 곳 이동 (관절 직접) ----------
     # 그리퍼를 수직으로 세운 채로는 손가락끝 ~0.10m 위로 못 올라간다 (joint5 한계).
     # 상자 벽(0.14m)을 넘는 이동은 ik.py 로 관절 각도를 직접 구해 JointCtrl 로 보낸다 (약간 기울어짐).
@@ -796,6 +844,11 @@ class SimPiper:
         j = self.joints
         return NS(time_stamp=time.time(), joint_state=NS(joint_1=j[0], joint_2=j[1], joint_3=j[2],
                                                          joint_4=j[3], joint_5=j[4], joint_6=j[5]))
+
+    def GetArmHighSpdInfoMsgs(self):
+        self._step()
+        m = NS(motor_speed=0, current=0, pos=0, effort=0.0)
+        return NS(time_stamp=time.time(), Hz=100.0, **{f"motor_{i}": m for i in range(1, 7)})
 
     def GetArmGripperMsgs(self):
         self._step()
