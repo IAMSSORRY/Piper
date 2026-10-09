@@ -222,50 +222,25 @@ def detect_apples(bgr, cfg, roi=None):
     v = cfg["vision"]
     bgr = color_correct(bgr, cfg)
     red, yellow, dark = _masks(bgr, v)
+    mask = ((red | yellow).astype(np.uint8) * 255)
     roi = v["tray_roi_px"] if roi is None else roi
-    roi_m = _roi_mask(bgr.shape, roi)
+    mask &= _roi_mask(bgr.shape, roi)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15)))
     rmin, rmax = v["min_radius_px"], v["max_radius_px"]
+    # 꼭지·반사광 같은 작은 구멍만 메운다. 사과 여러 개 사이 빈틈(큰 구멍)까지 메우면 가짜 큰 사과가 생긴다
+    cnts, hier = cv2.findContours(mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    filled = mask.copy()
     small = math.pi * (0.6 * rmin) ** 2
+    for c, h in zip(cnts, hier[0] if hier is not None else []):
+        if h[3] >= 0 and cv2.contourArea(c) < small:   # 구멍(부모 있음) 중 작은 것
+            cv2.drawContours(filled, [c], -1, 255, cv2.FILLED)
 
-    def clean(b):
-        m = (b.astype(np.uint8) * 255) & roi_m
-        m = cv2.morphologyEx(m, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
-        return cv2.morphologyEx(m, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15)))
-
-    def fill_small(m):
-        # 꼭지·반사광·멍 같은 작은 구멍만 메운다. 사과 여러 개 사이 빈틈(큰 구멍)까지 메우면 가짜 큰 사과가 생긴다
-        cnts, hier = cv2.findContours(m, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
-        f = m.copy()
-        for c, h in zip(cnts, hier[0] if hier is not None else []):
-            if h[3] >= 0 and cv2.contourArea(c) < small:   # 구멍(부모 있음) 중 작은 것
-                cv2.drawContours(f, [c], -1, 255, cv2.FILLED)
-        return f
-
-    mask = clean(red | yellow)
-    filled = fill_small(mask)
-    # 사과 중심 후보: 원 검출(Hough). 붙은 사과도 둘레 호가 보이면 따로 잡힌다 — 거리변환 봉우리는 붙은 사과 사이로
-    # 합쳐져서 02:56 사과 6개 중 2개만 잡았다. 원 안이 사과 색으로 충분히 차 있는 것만 쓴다
-    hc = cv2.HoughCircles(cv2.GaussianBlur(mask, (9, 9), 2), cv2.HOUGH_GRADIENT, dp=1, minDist=v.get("hough_min_dist_px", 60),
-                          param1=100, param2=v.get("hough_param2", 18), minRadius=int(rmin), maxRadius=int(rmax))
-    cand = []
     dist = cv2.distanceTransform(filled, cv2.DIST_L2, 5)
-    for cx, cy, r in ([] if hc is None else hc[0]):
-        circ = np.zeros(mask.shape, np.uint8)
-        cv2.circle(circ, (int(cx), int(cy)), int(r * 0.8), 1, -1)
-        if (filled[circ.astype(bool)] > 0).mean() < v.get("hough_fill_min", 0.7):
-            continue
-        # 중심 다듬기: 원 중심 근처(0.2r 안)에서 사과 안쪽으로 가장 깊은 점 (멀리 가면 붙은 사과 사이로 끌려간다)
-        near = np.zeros(mask.shape, np.uint8)
-        cv2.circle(near, (int(cx), int(cy)), max(2, int(r * 0.2)), 1, -1)
-        d = np.where(near.astype(bool), dist, 0)
-        py, px = np.unravel_index(int(np.argmax(d)), d.shape)
-        cand.append((float(max(d[py, px], rmin)), float(px), float(py)))
-    if not cand:   # 원이 하나도 안 잡히면 예전 방식(거리변환 봉우리)
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * int(rmin) + 1,) * 2)
-        peaks = (dist >= cv2.dilate(dist, k) - 1e-3) & (dist >= rmin)
-        n, _, _, cents = cv2.connectedComponentsWithStats(peaks.astype(np.uint8))
-        cand = [(float(dist[int(round(cy)), int(round(cx))]), cx, cy) for cx, cy in cents[1:]]
-    cand.sort(reverse=True)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * int(rmin) + 1,) * 2)
+    peaks = (dist >= cv2.dilate(dist, k) - 1e-3) & (dist >= rmin)
+    n, _, _, cents = cv2.connectedComponentsWithStats(peaks.astype(np.uint8))
+    cand = sorted(((float(dist[int(round(cy)), int(round(cx))]), cx, cy) for cx, cy in cents[1:]), reverse=True)
 
     apples = []
     for r, cx, cy in cand:
@@ -290,21 +265,11 @@ def grade_of(red_ratio, dark_ratio, v):
     return hi if top else lo
 
 
-def box_rect_px(cfg, calib, grade):
-    """상자 칸 사각형(로봇 좌표 중심 ± 크기/2) → 픽셀 다각형 4점. 크기는 boxes.<칸>.size_m [x, y]."""
-    b = cfg["boxes"][grade]
-    bx, by = b["xy_m"]
-    sx, sy = b.get("size_m", [0.08, cfg["place"].get("compartment_len_m", 0.195)])
-    pts = [(bx - sx / 2, by - sy / 2), (bx - sx / 2, by + sy / 2), (bx + sx / 2, by + sy / 2), (bx + sx / 2, by - sy / 2)]
-    return [[int(round(c)) for c in calib.xy2px(x, y)] for x, y in pts]
-
-
-def draw(bgr, apples, cfg, calib=None, extra=None, roi=None):
+def draw(bgr, apples, cfg, calib=None, extra=None):
     out = color_correct(bgr, cfg)
     x, y, w, h = cfg["vision"]["gray_card_roi_px"]
     cv2.rectangle(out, (x, y), (x + w, y + h), (200, 200, 200), 1)
-    if roi is not None:   # 실제로 사과를 찾은 영역
-        cv2.polylines(out, [np.array(roi, np.int32)], True, (255, 255, 0), 1)
+    cv2.polylines(out, [np.array(cfg["vision"]["tray_roi_px"], np.int32)], True, (255, 255, 0), 1)
     for i, a in enumerate(apples):
         col = (0, 0, 255) if a.grade == "상" else (0, 200, 255)   # 빨강 = 높은 등급, 노랑 = 낮은 등급
         cv2.circle(out, (int(a.u), int(a.v)), int(a.r), col, 2)
@@ -324,8 +289,9 @@ def draw(bgr, apples, cfg, calib=None, extra=None, roi=None):
         cv2.drawMarker(out, (int(u), int(v)), (255, 0, 255), cv2.MARKER_TILTED_CROSS, 20, 2)
         cv2.putText(out, "ZONE " + {"상": "A(top)", "중": "B(mid)", "하": "C(low)"}.get(name, name), (int(u) + 8, int(v)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
-        if calib is not None and "xy_m" in b:   # 칸 사각형
-            cv2.polylines(out, [np.array(box_rect_px(cfg, calib, name), np.int32)], True, (255, 0, 255), 1)
+        if calib is not None:   # 굴림 판정 구역
+            r_px = cfg["vision"]["box_radius_m"] / calib.m_per_px(u, v)
+            cv2.circle(out, (int(u), int(v)), int(r_px), (255, 0, 255), 1)
     for txt_i, txt in enumerate(extra or []):
         cv2.putText(out, txt, (10, 24 + 22 * txt_i), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
     return out
@@ -416,8 +382,7 @@ class BoxRollWatcher:
 
     def __init__(self, rc):
         self.rc = rc
-        # PIPER Studio camerad 가 장치를 쥐고 있으면 직접 못 연다 → 스트림 먼저, 안 되면 장치
-        self.cam = FrameSource(rc.get("stream_url"), rc["device"], rc["width"], rc["height"], rc.get("fourcc"))
+        self.cam = FrameSource(None, rc["device"], rc["width"], rc["height"], rc.get("fourcc"))
         self.before, self.track, self.t0 = [], [], None
         self._rec = threading.Event()
         self._th = threading.Thread(target=self._loop, daemon=True)
@@ -762,7 +727,7 @@ class CameraSignals:
               and math.hypot(a.x, a.y) <= ws.get("max_reach_xy_m", 9.0)]
         if len(ok) < len(apples):
             log.warning("닿지 않는 사과 %d개 제외 (베이스에서 %.2fm 넘음 등)", len(apples) - len(ok), ws.get("max_reach_xy_m", 9.0))
-        self._save(f"detect{i + 1}", draw(img, apples, self.cfg, self.calib, [f"apple {i + 1}: {len(ok)} found"], roi=roi))
+        self._save(f"detect{i + 1}", draw(img, apples, self.cfg, self.calib, [f"apple {i + 1}: {len(ok)} found"]))
         if not ok:
             log.warning("사과 검출 0개 (전체 후보 %d개)", len(apples))
             return None
@@ -809,15 +774,12 @@ class CameraSignals:
         if not seen and top is None:
             log.warning("회전 검사에서 사과가 안 보였음 → 색으로만 판정 (%s)", self.cur.grade)
             return self.cur.grade
-        b = self.cfg["inspect"]["bruise"]
-        thr, top_thr = b["ratio_max"], b.get("top_ratio_max", b["ratio_max"])
-        # 윗면(트레이 사진)은 꼭지·옆 사과 그림자가 멍처럼 잡혀서 따로 더 높은 기준 (02:56 멀쩡한 사과 꼭지 3.1% → 중)
-        rot_bad = bool(seen) and max(seen) > thr
-        top_bad = top is not None and top > top_thr
-        g = b.get("label", "중") if (rot_bad or top_bad) else hi
-        log.info("멍 최대 — 회전 %s (기준 %.1f%%), 윗면 %s (기준 %.1f%%) → %s",
-                 f"{max(seen) * 100:.1f}%" if seen else "-", thr * 100,
-                 "-" if top is None else f"{top * 100:.1f}%", top_thr * 100, g)
+        worst = max(seen + ([top] if top is not None else []))
+        log.info("멍: 윗면(트레이) %s, 회전 검사 최대 %s", "-" if top is None else f"{top * 100:.1f}%",
+                 f"{max(seen) * 100:.1f}%" if seen else "-")
+        thr = self.cfg["inspect"]["bruise"]["ratio_max"]
+        g = self.cfg["inspect"]["bruise"].get("label", "중") if worst > thr else hi
+        log.info("멍 최대 %.1f%% (기준 %.1f%%) → %s", worst * 100, thr * 100, g)
         return g
 
     def locate_boxes(self):
@@ -826,16 +788,6 @@ class CameraSignals:
         res, info, out = locate_boxes(img, self.cfg, self.calib)
         self._save("box", out)
         return res, info
-
-    def box_apples(self):
-        """지금 화면에서 상자 안 사과 [(x, y)] (로봇 좌표). 팔이 상자를 가리지 않을 때(트레이 위) 부른다.
-        놓을 칸의 빈 자리 찾기용 (mission._free_slot)."""
-        img = self.cam.latest(after=time.monotonic())
-        quad = find_box(img, self.cfg)
-        roi = quad.astype(int).tolist() if quad is not None else self.v["box"]["ref_corners_px"]
-        apples = apply_calib(detect_apples(img, self.cfg, roi=roi), self.calib)
-        self._save("boxview", draw(img, apples, self.cfg, self.calib, [f"box: {len(apples)} apples"]))
-        return [(a.x, a.y) for a in apples]
 
     def mark_bad(self):
         if self.cur is not None:
@@ -846,16 +798,6 @@ class CameraSignals:
         if self.cur is None:
             return None
         walls, center = getattr(self, "tray_walls", None), getattr(self, "tray_center", None)
-        tc = self.cfg.get("calibration", {})
-        if tc.get("walls_from_teach") and "corner1_xy_m" in tc:
-            # 손가락끝으로 잰 트레이 모서리(calibrate.py --teach) — 사진 추정보다 정확. 벽은 아래로 갈수록 안쪽이라 inset
-            (x1, y1), (x2, y2) = tc["corner1_xy_m"], tc["corner2_xy_m"]
-            m = tc.get("wall_inset_m", 0.015)
-            xa, xb = sorted((x1, x2))
-            ya, yb = sorted((y1, y2))
-            xa, xb, ya, yb = xa + m, xb - m, ya + m, yb - m
-            walls = [(xa, ya, xa, yb), (xa, yb, xb, yb), (xb, yb, xb, ya), (xb, ya, xa, ya)]
-            center = ((xa + xb) / 2, (ya + yb) / 2)
         if walls is None:
             poly = [self.calib.px2xy(u, v) for u, v in self.v["tray_roi_px"]]
             walls = [(*poly[i], *poly[(i + 1) % len(poly)]) for i in range(len(poly))]
@@ -890,7 +832,11 @@ class CameraSignals:
                 "bbox": [a.u - a.r, a.v - a.r, 2 * a.r, 2 * a.r], "extra": self.defect_extra()}
 
     def _box_roi(self, grade):
-        return box_rect_px(self.cfg, self.calib, grade)   # 칸 사각형 (예전엔 원)
+        bx, by = self.cfg["boxes"][grade]["xy_m"]
+        r = self.v["box_radius_m"]
+        pts = [self.calib.xy2px(bx + r * math.cos(t), by + r * math.sin(t))
+               for t in np.linspace(0, 2 * math.pi, 24, endpoint=False)]
+        return [[int(u), int(v)] for u, v in pts]
 
     def _box_apples(self, grade, img):
         return apply_calib(detect_apples(img, self.cfg, roi=self._box_roi(grade)), self.calib)
