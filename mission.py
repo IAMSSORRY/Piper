@@ -270,9 +270,14 @@ class Mission:
                 self._nudge(ax, ay, ctx)
                 raise NeedRedetect()
             raise RobotError(f"집으러 내려가다 닿음 (굴리기 {self._nudges}회 후): {e}")
+        # 닫기 시작할 때부터 이 자리를 기록 — 닫는 중·들어 올리는 중에 멈춰도 여기에 되돌린다
+        # (예전에는 다 올라온 뒤에 기록해서, 그 사이에 멈추면 트레이 가운데로 가져갔다). 못 집었으면 지운다
+        self.last_pick = (x, y, self.r.jaw_yaw)
         w = self.r.grip(False)
         min_w = c["gripper"]["min_grasp_width_m"]
         ok = w >= min_w
+        if not ok:
+            self.last_pick = None
         self.r.down_to(x, y, z_lift, p["lift_speed_pct"])
         if ok and self.r.gripper_width() < min_w:
             log.warning("상승 중 사과를 놓쳤습니다")
@@ -672,6 +677,8 @@ class Mission:
                     self.dash.mission("skip", index=i + 1, reason=str(e))
                     if hasattr(self.sig, "mark_bad"):
                         self.sig.mark_bad()   # 다음 검출에서 이 사과는 고르지 않는다
+                    # 쥔 채로(들어 올리는 중 등) 건너뛰면 다음 사과에서 그리퍼를 열 때 떨어뜨린다 → 먼저 되돌려 놓는다
+                    self.return_held()
                     self.r.go_home()
                     break
                 if ok:

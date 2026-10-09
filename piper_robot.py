@@ -176,12 +176,18 @@ class Robot:
             self.arm = SimPiper(self.cfg["sim"])
             log.info("[SIM] 실제 CAN 대신 시뮬레이터 사용")
         else:
+            # 다시 연결할 때(원격 해제 등) 이전 SDK 연결을 닫는다 — 안 닫으면 CAN 을 읽는 연결이 쌓인다
+            if self.arm is not None:
+                self.disconnect()
+                self.arm = None
             check_can(port)
             check_conflicts()
             try:
                 from piper_sdk import C_PiperInterface_V2
             except ImportError:
-                raise RobotError("piper_sdk 미설치: pip3 install piper_sdk  (pip 없으면 sudo apt install python3-pip)")
+                raise RobotError("piper_sdk 를 찾을 수 없습니다 — PIPER Studio 의 파이썬으로 실행하세요:\n"
+                                 "  ~/.venvs/piper-daemons/bin/python mission.py ...\n"
+                                 "  (그 파이썬이 없을 때만: pip3 install piper_sdk)")
             try:
                 self.arm = C_PiperInterface_V2(port)
             except Exception as e:
@@ -252,12 +258,32 @@ class Robot:
             time.sleep(0.01)
         log.error("!!! 비상정지 전송 완료 !!!")
 
-    def resume(self):
-        """비상정지 해제 (SDK EmergencyStop(0x02) == ResetPiper: 모터 전원이 잠깐 빠진다)."""
+    def resume(self, timeout=3.0):
+        """비상정지 해제 (SDK EmergencyStop(0x02) == ResetPiper: 모터 전원이 잠깐 빠진다).
+
+        보낸 뒤 로봇 상태가 실제로 '비상정지'(0x01)에서 벗어날 때까지 기다린다 (중간에 한 번 더 보낸다).
+        예전에는 0.5초만 기다리고 넘어가서, 늦게 풀리면 바로 뒤 connect() 가 '비상정지 상태'로 거부했다."""
         self.arm.EmergencyStop(0x02)
-        self._estopped.clear()
-        time.sleep(0.5)
         log.info("비상정지 해제 전송")
+        t0 = time.monotonic()
+        resent = False
+        while True:
+            time.sleep(0.1)
+            try:
+                code = int(self._status().arm_status)
+            except Exception:
+                code = None
+            if code is not None and code != 0x01:
+                break
+            if not resent and time.monotonic() - t0 > timeout / 2:
+                self.arm.EmergencyStop(0x02)
+                resent = True
+                log.warning("비상정지가 아직 안 풀림 — 해제 다시 전송")
+            if time.monotonic() - t0 > timeout:
+                log.error("비상정지 해제 후 %.0f초가 지나도 상태가 비상정지(0x01)", timeout)
+                break
+        self._estopped.clear()
+        time.sleep(0.3)
 
     def hold(self):
         """현재 위치를 목표로 다시 보내 그 자리에 세운다 (전원 유지, 낙하 없음). 섰으면 True.
@@ -267,11 +293,15 @@ class Robot:
         if self.arm is None or self._estopped.is_set():
             return False
         try:
-            x, y, z, rx, ry, rz = self.current_pose()
+            # 지금 관절 각도를 그대로 목표로 보낸다 (MOVE_J). 예전에는 말단 자세(MOVE_P)를 보냈는데, 펌웨어가
+            # 그 자세의 관절 해를 다시 풀면서 손목(joint6)을 다른 쪽으로 크게 돌릴 수 있었다 (21:33 실측 170°) —
+            # '그 자리 정지'가 오히려 큰 동작이 될 수 있다. 관절 목표는 해가 하나라 정말 그 자리다.
+            q = [rad2sdk(v) for v in self.current_joints()]
             for _ in range(3):
-                self.arm.MotionCtrl_2(CTRL_CAN, MOVE_P, 10, 0x00)
-                self.arm.EndPoseCtrl(m2sdk(x), m2sdk(y), m2sdk(z), rad2sdk(rx), rad2sdk(ry), rad2sdk(rz))
+                self.arm.MotionCtrl_2(CTRL_CAN, MOVE_J, 10, 0x00)
+                self.arm.JointCtrl(*q)
                 time.sleep(0.02)
+            x, y, z = self.current_pose()[:3]
             log.warning("현재 위치 정지 (%.3f, %.3f, %.3f)", x, y, z)
             return True
         except Exception as e:

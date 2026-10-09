@@ -180,8 +180,17 @@ class Controller:
             self._estop_now.clear()
             if self.state == "estopped" or self.r._estopped.is_set():
                 log.warning("비상정지 해제 — 해제 순간 모터 전원이 잠깐 빠져 팔이 처질 수 있다")
-                self.r.resume()          # SDK EmergencyStop(0x02)
-                time.sleep(1.0)
+                # `mission.py --resume` 과 같은 순서: 새로 연결 → 해제 → 실제로 풀릴 때까지 기다림 → (아래) 모터 enable.
+                # 예전에는 오래된 연결로 해제를 보내고 1초 뒤 바로 확인해, 늦게 풀리거나 연결이 끊겨 있으면
+                # '비상정지 상태입니다 … --resume 실행' 으로 거부됐다
+                try:
+                    self.r.connect(enable=False)
+                except RobotFault:
+                    pass                 # 비상정지 상태라 거부된 것 — 연결 자체는 됐다
+                except RobotError as e:
+                    self._set("error", f"해제 실패: {e}")
+                    return False, str(e)
+                self.r.resume()          # SDK EmergencyStop(0x02) + 풀릴 때까지 대기
             try:
                 self.r.connect(enable=True)   # 상태 확인 + 모터 enable (비상정지가 안 풀렸으면 여기서 거부)
             except RobotError as e:
