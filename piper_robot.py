@@ -295,6 +295,11 @@ class Robot:
             self.fm_over_since = self.fm_over_since or now
             if now - self.fm_over_since >= self.fm_hold:
                 j = over[0]
+                self.fm_on = False   # hold 동작 중 재발 방지
+                try:
+                    self.hold()      # 펌웨어는 받은 목표로 계속 가므로, 감지 즉시 '여기서 멈춤'을 보낸다
+                finally:
+                    self.fm_on = True
                 raise ForceStop(f"관절{j + 1} 부하 이상: {e[j]:+.2f} N·m (평소 {self.fm_base[j]:+.2f}, 기준 ±{self.fm_thr[j]:.1f}) "
                                 f"— 어딘가에 닿은 것 같습니다")
         else:
@@ -501,8 +506,9 @@ class Robot:
         rz = math.atan2(R[1, 0], R[0, 0])
         return rx, ry, rz
 
-    def _q6_for_jaw(self, q, yaw):
-        """joint6 만 돌려서 집게 방향을 yaw 에 맞춘다 (한계 안에서 가장 가까운 값)."""
+    def _q6_for_jaw(self, q, yaw, ref=None):
+        """joint6 만 돌려서 집게 방향을 yaw 에 맞춘다. 같은 방향(180° 대칭) 중 ref(지금 손목)에 가장 가까운 값."""
+        ref = q[5] if ref is None else ref
         import ik
         best = None
         lo, hi = -2.09, 2.09
@@ -512,7 +518,7 @@ class Robot:
             p = ik._FK().CalFK(qq)[-1]
             a = self._jaw_axis_world(ik._rot(*[math.radians(v) for v in p[3:]]))
             err = abs((a - yaw + math.pi / 2) % math.pi - math.pi / 2)
-            if best is None or err < best[0] - 1e-6 or (abs(err - best[0]) < 1e-6 and abs(q6 - q[5]) < abs(best[1] - q[5])):
+            if best is None or err < best[0] - 0.02 or (abs(err - best[0]) <= 0.02 and abs(q6 - ref) < abs(best[1] - ref)):
                 best = (err, q6)
         return list(q[:5]) + [best[1]]
 
@@ -544,10 +550,11 @@ class Robot:
         tip = z_flange - self.tool_len
         self._check_ws(x, y, z_flange)
         q, tilt = self._ik(x, y, tip)
-        if tilt < 1.0 and abs(q[4]) <= float(self.cfg.get("j5_firmware_max_rad", 1.10)):
+        # 집게 방향을 정했으면 항상 관절 명령 — 펌웨어 IK 는 손목(joint6)을 엉뚱한 쪽으로 크게 돌린다 (21:33 실측 170°)
+        if self.jaw_yaw is None and tilt < 1.0 and abs(q[4]) <= float(self.cfg.get("j5_firmware_max_rad", 1.10)):
             return self.move_to(x, y, z_flange, speed_pct, linear=True)
         if self.jaw_yaw is not None:
-            q = self._q6_for_jaw(q, self.jaw_yaw)
+            q = self._q6_for_jaw(q, self.jaw_yaw, ref=self.current_joints()[5])
         (log.warning if tilt > 15 else log.info)("down_to (%.3f, %.3f) 손가락끝 z %.3f — 관절 계산, 기울기 %.0f°",
                                                  x, y, tip, tilt)
         self.move_joints(q, speed_pct)

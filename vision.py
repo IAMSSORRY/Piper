@@ -556,6 +556,8 @@ def bruise_score(bgr, cfg):
     if st[k, cv2.CC_STAT_AREA] < b["min_apple_px"]:
         return None, int(st[k, cv2.CC_STAT_AREA]), img
     apple = (lab == k).astype(np.uint8)
+    # 구멍(아주 어두운 곳)은 채우지 않는다: 채우면 꽃받침(밑동의 둥근 검은 오목)까지 멍으로 센다 (21:40 실측).
+    # 진한 멍은 가장자리의 덜 어두운 부분으로 잡힌다 (멍 사과 6.0% vs 멀쩡한 사과 0.2% 이하)
     # 가장자리(손가락 그림자·반사)는 빼고 안쪽만 본다: 가장자리에서 반지름의 edge_frac 이상 들어간 곳
     dist = cv2.distanceTransform(apple, cv2.DIST_L2, 5)
     apple = dist >= dist.max() * b.get("edge_frac", 0.25)
@@ -728,6 +730,7 @@ class CameraSignals:
         img = self.cam.latest(after=time.monotonic() + 0.05)
         ratio, px, out = bruise_score(img, self.cfg)
         self._save(f"inspect_{tag}", out)
+        self._save(f"inspect_{tag}_raw", img)      # 기준값 다시 맞출 때 쓰는 원본
         self.bruises.append(ratio)
         log.info("  검사 %s: 사과 %dpx, 멍 %s", tag, px, "안 보임" if ratio is None else f"{ratio * 100:.1f}%")
         return ratio
