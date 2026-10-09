@@ -43,6 +43,8 @@ $PY vision.py                      # 검출 화면 (빨강=상, 노랑=중)
 $PY calibrate.py                   # 트레이 비우고, 그리퍼가 열리면 사과 1개를 손가락 판 가운데에 → Enter
 $PY calibrate.py --verify          # 사과마다 위로 가서 멈춤 → 중심 확인 (어긋나면 pick.grasp_offset_m)
 $PY mission.py                     # 본 미션 (calib.yaml 있으면 카메라 모드)
+$PY mission.py --apples 8          # 사과 개수 지정 (기본: 환경변수 MISSION_APPLE_COUNT → config mission.apple_count)
+$PY mission.py --apples all        # 트레이에 사과가 없을 때까지 (0 / all). 대시보드에는 apple_count: null
 $PY mission.py --signals manual    # 카메라 없이: 좌표·등급을 터미널로
 ```
 
