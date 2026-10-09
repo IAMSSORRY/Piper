@@ -4,12 +4,16 @@
 
   GET  /status                  상태 {state, index, placed, results, error}
   POST /start   {"apples": 5}   미션 시작 (5개 / "all" = 트레이가 빌 때까지 / 생략 = config)
-  POST /estop                   비상정지
+  POST /estop                   비상정지: 즉시 그 자리 정지 → 실제 비상정지. 언제든 바로 처리된다(다른 명령을 기다리지 않음)
+  POST /park                    정리 후 정지: 그 자리 정지 → 쥔 사과를 집은 자리에 되돌림 → 팔을 낮게 → 실제 비상정지
+                                (진행 중 /estop 을 누르면 정리를 버리고 즉시 비상정지)
   POST /resume                  비상정지(또는 오류 정지) 해제 → 멈춘 사과부터 이어서
   POST /stop                    지금 사과까지만 하고 멈춤
 
-state: idle(대기) / running(실행 중) / stopping(비상정지 처리 중) / estopped(비상정지) / error(오류로 그 자리 정지) / done(완료)
-비상정지: 그 자리 정지 → 사과를 쥐고 있으면 집은 자리에 되돌려 놓기 → 팔을 낮게 내리기 → 실제 비상정지(모터 정지)
+state: idle(대기) / running(실행 중) / stopping(/park 정리 중) / estopped(비상정지) / error(오류로 그 자리 정지) / done(완료)
+
+⚠ 비상정지는 '즉시 그 자리'다. 예전에는 /estop 이 사과 되돌리기·팔 내리기를 먼저 했고(최대 ~20초),
+  그 사이 미션 스레드가 정지 요청을 '사과 건너뜀'으로 삼켜 계속 돌면서 두 스레드가 팔을 같이 움직였다 (10-09 SIM 재현).
 토큰: Authorization: Bearer <SSORRY_TOKEN> (대시보드 ingest 토큰과 같은 값). 토큰이 없으면 검사 안 함.
 """
 import json
@@ -18,7 +22,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from piper_robot import ForceStop, RobotError, RobotFault, SoftStop
+from piper_robot import ForceStop, RobotError, RobotFault, SoftStop  # noqa: F401 (SoftStop: _work)
 
 log = logging.getLogger("control")
 
@@ -29,7 +33,8 @@ class Controller:
         self.mission = None
         self.state, self.error = "idle", None
         self._th = None
-        self._lock = threading.Lock()
+        self._lock = threading.Lock()       # start / resume / park 끼리만. /estop 은 이 잠금을 기다리지 않는다
+        self._estop_now = threading.Event()  # /estop 이 들어옴 → /park 정리 중이면 버린다
 
     # ---- 상태 ----
     def status(self):
@@ -57,12 +62,13 @@ class Controller:
         try:
             self.mission.run(resume=resume)
             self._set("done")
-        except SoftStop:                 # 원격 비상정지 — estop() 이 이어서 안전 동작 후 실제 비상정지
-            self._set("stopping", "원격 비상정지")
+        except SoftStop:                 # 원격 정지 요청 — 그 자리에 섰다. 상태는 요청한 쪽(estop / park)이 정한다
+            log.info("미션 스레드: 정지 요청으로 그 자리에서 멈춤")
         except RobotFault as e:          # 비상정지 버튼·PIPER Studio 비상정지·로봇 고장
             if not self.r._estopped.is_set():
                 self.r.estop()
-            self._set("estopped", str(e))
+            if not self._estop_now.is_set():   # /estop 으로 멈춘 거면 상태는 estop() 이 정한다 (이벤트 중복 방지)
+                self._set("estopped", str(e))
         except ForceStop as e:           # 힘 이상 — 이미 그 자리에 섰다
             self._set("error", f"힘 이상 자동 정지: {e}")
         except (RobotError, IOError) as e:
@@ -81,43 +87,97 @@ class Controller:
     # ---- 명령 ----
     def start(self, apples=None):
         with self._lock:
-            if self.state == "running":
-                return False, "이미 실행 중"
+            if self.state in ("running", "stopping"):
+                return False, "이미 실행 / 정리 중"
+            if self.r._estopped.is_set():
+                return False, "비상정지 상태 — /resume 으로 해제한 뒤 시작"
+            if self._th is not None and self._th.is_alive():
+                return False, "이전 미션이 아직 끝나지 않음"
+            self.r.clear_soft_stop()
+            self._estop_now.clear()
             if apples is not None:
                 self.cfg["mission"]["apple_count"] = None if str(apples).lower() in ("all", "0") else int(apples)
             self.mission = self.make_mission()
             self._launch(resume=False)
             return True, "시작"
 
+    def _stop_mission_thread(self, timeout):
+        """미션 스레드에 정지 요청을 보내고 끝나기를 기다린다. 끝났으면 True."""
+        th = self._th
+        if th is None or not th.is_alive():
+            return True
+        self.r.soft_stop()
+        th.join(timeout=timeout)
+        return not th.is_alive()
+
     def estop(self):
-        """원격 비상정지: 하던 동작을 그 자리에서 멈춤 → (사과를 쥐고 있으면 집은 자리에 되돌려 놓고) 팔을 낮게
-        내림 → 실제 비상정지(모터 정지). 안전 동작이 실패하면 바로 실제 비상정지."""
-        with self._lock:
+        """비상정지: 즉시 그 자리 정지 → 실제 비상정지(SDK EmergencyStop). 잠금을 기다리지 않는다.
+
+        미션 스레드는 다음 검사(10ms)에서 정지 요청(SoftStop)이나 비상정지(RobotFault)로 빠져나온다.
+        /park 정리 중이었으면 정리 동작도 다음 검사에서 끊긴다.
+        """
+        self._estop_now.set()
+        already = self.r._estopped.is_set()
+        self.r.soft_stop()               # 미션 스레드가 하던 명령을 이어 보내지 않게
+        if not already:
+            self.r.hold()                # 펌웨어는 받은 목표로 계속 가므로 '여기서 멈춤'을 먼저 보낸다
+        self.r.estop()                   # 실제 비상정지 (여러 번 눌러도 다시 보낸다)
+        th = self._th
+        if th is not None and th.is_alive():
+            th.join(timeout=2.0)
+            if th.is_alive():
+                log.error("미션 스레드가 2초 안에 안 끝났다 — 비상정지는 이미 보냈다")
+        note = "비상정지" + (" (다시 전송)" if already else "")
+        self._set("estopped", note)
+        return True, note
+
+    def park(self):
+        """정리 후 정지: 그 자리 정지 → 쥔 사과를 집은 자리에 되돌림 → 팔을 낮게 → 실제 비상정지.
+        정리 중 /estop 이 오면 정리를 버리고 즉시 비상정지(estop 이 처리)."""
+        if not self._lock.acquire(blocking=False):
+            return False, "다른 명령 처리 중 — 바로 멈추려면 /estop"
+        try:
             if self.r._estopped.is_set():
-                return True, "이미 비상정지 상태"
-            if self.state == "running":
-                self.r.soft_stop()
-                if self._th is not None:
-                    self._th.join(timeout=8)
-            self.r.clear_soft_stop()
-            note = "원격 비상정지"
+                return False, "이미 비상정지 상태 — 정리하려면 /resume 후 다시 /park"
+            self._estop_now.clear()
+            if not self._stop_mission_thread(timeout=3.0):
+                # 미션 스레드가 안 멈췄다 — 두 스레드가 팔을 같이 움직이게 두지 않는다
+                log.error("미션 스레드가 3초 안에 안 멈춤 → 정리 없이 즉시 비상정지")
+                self.r.estop()
+                self._set("estopped", "정리 후 정지 실패: 미션이 안 멈춰 즉시 비상정지")
+                return True, "미션이 안 멈춰 즉시 비상정지"
+            self._set("stopping", "정리 후 정지 중")
+            self.r.clear_soft_stop()     # 미션 스레드가 끝났으니 지워도 된다 (정리 동작이 움직일 수 있게)
+            note = "정리 후 정지"
             try:
-                if self.mission is not None and self.cfg.get("estop", {}).get("safe_park", True):
-                    self.mission.safe_park()
-                    note += " (사과 되돌림·팔 내림 후)"
+                if self._estop_now.is_set():
+                    raise RobotFault("정리 전에 비상정지 요청")
+                if self.mission is not None:
+                    returned = self.mission.safe_park()
+                    note += " (사과 되돌림·팔 내림 후)" if returned else " (팔 내림 후)"
             except Exception as e:
-                log.error("비상정지 안전 동작 실패 → 바로 비상정지: %s", e)
-                note += f" (안전 동작 실패: {e})"
+                if self._estop_now.is_set() or self.r._estopped.is_set():
+                    return True, "정리 중 비상정지 요청 — 즉시 정지"   # 상태는 estop() 이 이미 정했다
+                log.error("정리 동작 실패 → 바로 비상정지: %s", e)
+                note += f" (정리 실패: {e})"
+            if self._estop_now.is_set():
+                return True, "정리 중 비상정지 요청 — 즉시 정지"
             self.r.estop()
             self._set("estopped", note)
             return True, note
+        finally:
+            self._lock.release()
 
     def resume(self):
         with self._lock:
-            if self.state == "running":
-                return False, "실행 중 — 해제할 것이 없음"
+            if self.state in ("running", "stopping"):
+                return False, "실행 / 정리 중 — 해제할 것이 없음"
             if self._th is not None:
                 self._th.join(timeout=5)
+                if self._th.is_alive():
+                    return False, "이전 미션이 아직 끝나지 않음 — 잠시 뒤 다시"
+            self.r.clear_soft_stop()
+            self._estop_now.clear()
             if self.state == "estopped" or self.r._estopped.is_set():
                 log.warning("비상정지 해제 — 해제 순간 모터 전원이 잠깐 빠져 팔이 처질 수 있다")
                 self.r.resume()          # SDK EmergencyStop(0x02)
@@ -174,7 +234,8 @@ def serve(controller, host, port, token):
             except ValueError:
                 return self._send(400, {"ok": False, "error": "JSON 형식 오류"})
             route = {"/start": lambda: controller.start(body.get("apples")),
-                     "/estop": controller.estop, "/resume": controller.resume, "/stop": controller.stop}
+                     "/estop": controller.estop, "/park": controller.park,
+                     "/resume": controller.resume, "/stop": controller.stop}
             fn = route.get(self.path.rstrip("/"))
             if fn is None:
                 return self._send(404, {"ok": False, "error": "없는 경로"})
