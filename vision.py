@@ -48,9 +48,10 @@ class FrameSource:
             self._frame, self._t = img, time.monotonic()
 
     def _run(self):
+        use_url = bool(self.url)
         while not self._stop.is_set():
             try:
-                if self.url:
+                if use_url:
                     self._read_http()
                 else:
                     self._read_device()
@@ -58,9 +59,10 @@ class FrameSource:
                 if self._err != str(e):
                     log.warning("카메라 읽기 실패: %s (재시도)", e)
                     self._err = str(e)
-                if self.url and self.device and self._frame is None:
-                    log.warning("스트림 실패 → 장치 직접 열기 %s", self.device)
-                    self.url = None
+                # 스트림 ↔ 장치를 번갈아 시도 (camerad 가 재연결 중이면 장치는 잠겨 있고 스트림은 잠깐 빈다)
+                if self.url and self.device:
+                    use_url = not use_url
+                    log.info("카메라 소스 전환 → %s", self.url if use_url else self.device)
                 time.sleep(0.5)
 
     def _read_http(self):
@@ -112,7 +114,7 @@ class FrameSource:
                 if self._frame is not None and self._t > after:
                     return self._frame.copy()
             time.sleep(0.01)
-        raise IOError(f"카메라 프레임이 {timeout:.1f}s 동안 안 들어옵니다 ({self.url or self.device})"
+        raise IOError(f"카메라 프레임이 {timeout:.1f}s 동안 안 들어옵니다 ({self.url} / {self.device})"
                       + (f" — {self._err}" if self._err else ""))
 
     def close(self):
