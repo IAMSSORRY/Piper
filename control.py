@@ -4,12 +4,13 @@
 
   GET  /status                  상태 {state, index, placed, results, error}
   POST /start   {"apples": 5}   미션 시작 (5개 / "all" = 트레이가 빌 때까지 / 생략 = config)
-  POST /estop                   비상정지
+  POST /estop                   비상정지: 즉시 그 자리 정지 → 모터 정지 (~0.2초). 팔을 낮추지 않는다
+  POST /park                    정리 후 정지: 그 자리 정지 → 쥔 사과를 집은 자리에 되돌림 → 팔을 낮게 → 모터 정지 (끝나고 응답)
   POST /resume                  비상정지(또는 오류 정지) 해제 → 멈춘 사과부터 이어서
   POST /stop                    지금 사과까지만 하고 멈춤
 
-state: idle(대기) / running(실행 중) / stopping(비상정지 처리 중) / estopped(비상정지) / error(오류로 그 자리 정지) / done(완료)
-비상정지: 그 자리 정지 → 사과를 쥐고 있으면 집은 자리에 되돌려 놓기 → 팔을 낮게 내리기 → 실제 비상정지(모터 정지)
+state: idle(대기) / running(실행 중) / stopping(/park 정리 중) / estopped(비상정지) / error(오류로 그 자리 정지) / done(완료)
+/estop 은 잠금 없이 바로 나간다 — /park 정리 중이어도 즉시 멈춘다.
 토큰: Authorization: Bearer <SSORRY_TOKEN> (대시보드 ingest 토큰과 같은 값). 토큰이 없으면 검사 안 함.
 """
 import json
@@ -57,12 +58,13 @@ class Controller:
         try:
             self.mission.run(resume=resume)
             self._set("done")
-        except SoftStop:                 # 원격 비상정지 — estop() 이 이어서 안전 동작 후 실제 비상정지
-            self._set("stopping", "원격 비상정지")
-        except RobotFault as e:          # 비상정지 버튼·PIPER Studio 비상정지·로봇 고장
+        except SoftStop:                 # /park — park() 가 이어서 정리 후 비상정지 (상태는 park 가 정한다)
+            pass
+        except RobotFault as e:          # 비상정지 버튼·PIPER Studio 비상정지·로봇 고장·/estop
             if not self.r._estopped.is_set():
                 self.r.estop()
-            self._set("estopped", str(e))
+            if self.state != "estopped":   # /estop 이 이미 정했으면 그 이유를 둔다
+                self._set("estopped", str(e))
         except ForceStop as e:           # 힘 이상 — 이미 그 자리에 섰다
             self._set("error", f"힘 이상 자동 정지: {e}")
         except (RobotError, IOError) as e:
@@ -90,24 +92,36 @@ class Controller:
             return True, "시작"
 
     def estop(self):
-        """원격 비상정지: 하던 동작을 그 자리에서 멈춤 → (사과를 쥐고 있으면 집은 자리에 되돌려 놓고) 팔을 낮게
-        내림 → 실제 비상정지(모터 정지). 안전 동작이 실패하면 바로 실제 비상정지."""
+        """원격 비상정지: 즉시 그 자리 정지 → 모터 정지 (~0.2초). 팔을 낮추지 않는다.
+        잠금을 기다리지 않는다 — /park 정리 중이어도 바로 멈춘다 (정리 동작은 RobotFault 로 끊긴다)."""
+        if self.r._estopped.is_set():
+            return True, "이미 비상정지 상태"
+        self.r.estop()
+        self._set("estopped", "원격 비상정지")
+        return True, "원격 비상정지"
+
+    def park(self):
+        """정리 후 정지: 하던 동작을 그 자리에서 멈춤 → (사과를 쥐고 있으면 집은 자리에 되돌려 놓고) 팔을 낮게
+        내림 → 비상정지(모터 정지). 끝난 뒤 응답한다. 정리가 실패하면 바로 비상정지."""
         with self._lock:
             if self.r._estopped.is_set():
-                return True, "이미 비상정지 상태"
+                return False, "이미 비상정지 상태"
             if self.state == "running":
                 self.r.soft_stop()
                 if self._th is not None:
                     self._th.join(timeout=8)
             self.r.clear_soft_stop()
-            note = "원격 비상정지"
+            self._set("stopping", "정리 후 정지")
+            note = "정리 후 정지"
             try:
                 if self.mission is not None and self.cfg.get("estop", {}).get("safe_park", True):
                     self.mission.safe_park()
                     note += " (사과 되돌림·팔 내림 후)"
             except Exception as e:
-                log.error("비상정지 안전 동작 실패 → 바로 비상정지: %s", e)
-                note += f" (안전 동작 실패: {e})"
+                if self.r._estopped.is_set():    # 정리 중에 /estop 이 왔다 — 이미 멈췄고 상태도 estopped
+                    return True, "정리 중 비상정지로 바로 멈춤"
+                log.error("정리 동작 실패 → 바로 비상정지: %s", e)
+                note += f" (정리 실패: {e})"
             self.r.estop()
             self._set("estopped", note)
             return True, note
@@ -174,7 +188,7 @@ def serve(controller, host, port, token):
             except ValueError:
                 return self._send(400, {"ok": False, "error": "JSON 형식 오류"})
             route = {"/start": lambda: controller.start(body.get("apples")),
-                     "/estop": controller.estop, "/resume": controller.resume, "/stop": controller.stop}
+                     "/estop": controller.estop, "/park": controller.park, "/resume": controller.resume, "/stop": controller.stop}
             fn = route.get(self.path.rstrip("/"))
             if fn is None:
                 return self._send(404, {"ok": False, "error": "없는 경로"})
@@ -187,5 +201,5 @@ def serve(controller, host, port, token):
             log.debug("http %s", fmt % args)
 
     srv = ThreadingHTTPServer((host, port), H)
-    log.info("원격 제어 대기: http://%s:%d  (GET /status, POST /start /estop /resume /stop)", host, port)
+    log.info("원격 제어 대기: http://%s:%d  (GET /status, POST /start /estop /park /resume /stop)", host, port)
     srv.serve_forever()
