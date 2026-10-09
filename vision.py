@@ -226,33 +226,55 @@ def _drop_small(mask, min_px):
     return keep[lab]
 
 
-def defects(hsv, cx, cy, r, v):
-    """사과 하나의 멍·상처 비율. 사과 안쪽 원(inner_frac)만 본다 — 구의 가장자리는 원래 어두워 멍으로 오인된다.
+def apple_region(hsv, cx, cy, r, v, others=()):
+    """사과 하나가 실제로 차지하는 영역. 검출 원(내접원)은 결함 쪽으로 줄어들어(결함 색은 사과 색이 아니므로)
+    가장자리 결함을 놓친다 → 원을 outer_frac 배로 키우고, 트레이 배경(청록)과 이웃 사과 쪽을 뺀다."""
+    d = v.get("defects") or {}
+    h, s, val = hsv
+    outer = np.zeros(h.shape, np.uint8)
+    cv2.circle(outer, (int(cx), int(cy)), max(1, int(r * d.get("outer_frac", 1.25))), 1, -1)
+    region = outer.astype(bool)
+    b_lo, b_hi = d.get("bg_hue", [70, 110])
+    region &= ~((h >= b_lo) & (h <= b_hi) & (s >= d.get("bg_sat_min", 30)))   # 트레이(그림자 포함)
+    if others:
+        ys, xs = np.nonzero(region)
+        mine = (xs - cx) ** 2 + (ys - cy) ** 2
+        for ox, oy in others:   # 이웃 사과 중심에 더 가까운 픽셀은 그 사과 것
+            closer = (xs - ox) ** 2 + (ys - oy) ** 2 < mine
+            region[ys[closer], xs[closer]] = False
+    return region
 
-    - 멍: 그 사과 색 영역의 밝기 중앙값보다 bruise_val_drop 배 넘게 어둡고(흠보다는 밝은) 빨강~갈색 영역
-    - 상처: 채도가 낮고 밝은 크림색(과육) 영역. 반사광(아주 밝고 거의 무채색인 점)은 뺀다
-    둘 다 min_blob_px 보다 작은 덩어리는 잡음으로 본다. 반환: (멍 비율, 상처 비율)
+
+def defects(hsv, cx, cy, r, v, others=()):
+    """사과 하나의 흠·멍·상처 비율 (apple_region 기준). 반환: (흠, 멍, 상처)
+
+    - 흠: 아주 어두운 점 (V < dark_val_max). 사과 영역 어디든 센다 (가장자리 결함 포함)
+    - 멍: 그 사과 색 영역 밝기 중앙값의 bruise_val_drop 배보다 어두운 빨강~갈색(흠보다는 밝은).
+          구 가장자리는 원래 어두우므로 안쪽 원(inner_frac)에서만 센다
+    - 상처: 채도가 낮고 밝은 크림색(과육). 반사광(아주 밝고 거의 무채색)은 뺀다
+    min_blob_px 보다 작은 덩어리는 잡음으로 본다.
     """
     d = v.get("defects") or {}
     h, s, val = hsv
+    region = apple_region(hsv, cx, cy, r, v, others)
+    area = max(1, int(region.sum()))
     inner = np.zeros(h.shape, np.uint8)
     cv2.circle(inner, (int(cx), int(cy)), max(1, int(r * d.get("inner_frac", 0.7))), 1, -1)
-    inner = inner.astype(bool)
-    area = max(1, int(inner.sum()))
+    inner = inner.astype(bool) & region
     skin = inner & (s >= v["sat_min"]) & (val >= v["val_min"])
     if not skin.any():
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0
     med_v = float(np.median(val[skin]))
+    min_px = d.get("min_blob_px", 15)
+    dark = region & (val < v["dark_val_max"])
     brownish = (h <= d.get("bruise_hue_max", 30)) | (h >= v["red_hue"][1])
     bruise = (inner & brownish & (val >= v["dark_val_max"]) & (s >= d.get("bruise_sat_min", 40))
               & (val < med_v * d.get("bruise_val_drop", 0.65)))
     w_lo, w_hi = d.get("wound_hue", [10, 40])
     glare = (val >= d.get("glare_val_min", 235)) & (s < d.get("glare_sat_max", 25))   # 아주 밝고 거의 무채색
-    wound = (inner & (s <= d.get("wound_sat_max", 80)) & (val >= d.get("wound_val_min", 120))
+    wound = (region & (s <= d.get("wound_sat_max", 80)) & (val >= d.get("wound_val_min", 120))
              & ~glare & (h >= w_lo) & (h <= w_hi))
-    min_px = d.get("min_blob_px", 30)
-    return (float(_drop_small(bruise, min_px).sum()) / area,
-            float(_drop_small(wound, min_px).sum()) / area)
+    return tuple(float(_drop_small(m, min_px).sum()) / area for m in (dark, bruise, wound))
 
 
 def _roi_mask(shape, poly):
@@ -298,11 +320,14 @@ def detect_apples(bgr, cfg, roi=None):
         c = circ.astype(bool)
         n_red, n_yel = int((red & c).sum()), int((yellow & c).sum())
         red_ratio = n_red / max(1, n_red + n_yel)
-        dark_ratio = float((dark & c).sum()) / max(1, int(c.sum()))
-        bruise_ratio, wound_ratio = defects(hsv, cx, cy, r, v)
-        grade, reasons = grade_of(red_ratio, dark_ratio, v, bruise_ratio, wound_ratio)
-        apples.append(Apple(float(cx), float(cy), r, red_ratio, dark_ratio, grade,
-                            bruise_ratio=bruise_ratio, wound_ratio=wound_ratio, reasons=tuple(reasons)))
+        apples.append(Apple(float(cx), float(cy), r, red_ratio, 0.0, ""))
+
+    # 결함은 모든 사과를 찾은 뒤에 본다 — 이웃 사과 영역을 빼야 하므로
+    for a in apples:
+        others = [(o.u, o.v) for o in apples if o is not a]
+        a.dark_ratio, a.bruise_ratio, a.wound_ratio = defects(hsv, a.u, a.v, a.r, v, others)
+        a.grade, reasons = grade_of(a.red_ratio, a.dark_ratio, v, a.bruise_ratio, a.wound_ratio)
+        a.reasons = tuple(reasons)
     return apples
 
 
