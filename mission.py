@@ -156,6 +156,7 @@ class Mission:
     def __init__(self, robot, cfg, tuner, signals, dash=None, roll=None):
         self.r, self.cfg, self.tuner, self.sig = robot, cfg, tuner, signals
         self.dash = dash or Dashboard({})
+        self.placed = {}      # 칸별 놓은 개수
         self.roll = roll      # 굴림 카메라 (vision.BoxRollWatcher). 없으면 signals.rolled()
 
     def pick(self, x, y):
@@ -214,10 +215,18 @@ class Mission:
     def place(self, grade):
         """등급 상자 위 → 하강 → 놓기 → 상승."""
         b, p = self.cfg["boxes"][grade], self.cfg["place"]
-        # 집은 방향 그대로 놓는다 (쥔 채로 손목을 돌리지 않는다)
-        bx, by = b["xy_m"]
+        # 칸 안 자리: 칸마다 놓은 개수만큼 다음 자리로 (같은 자리에 겹쳐 놓으면 먼저 놓은 사과를 밀어낸다)
+        slots = p.get("slots", [{"dxy_m": [0.0, 0.0], "dz_m": 0.0}])
+        k = self.placed.get(grade, 0)
+        slot = slots[min(k, len(slots) - 1)]
+        self.placed[grade] = k + 1
+        bx, by = b["xy_m"][0] + slot["dxy_m"][0], b["xy_m"][1] + slot["dxy_m"][1]
+        if p.get("place_jaw_yaw_deg") is not None:   # 칸 안에서는 손가락이 이웃 사과 쪽으로 안 가게
+            self.r.jaw_yaw = math.radians(p["place_jaw_yaw_deg"])
+        log.info("'%s' 칸 %d번째 자리 (%.3f, %.3f)%s", grade, k + 1, bx, by,
+                 " — 위에 얹음 +%.0fmm" % (slot["dz_m"] * 1000) if slot["dz_m"] else "")
         z_lift = self.r.lift_z(bx, by)
-        z_rel = b["floor_z_m"] + self.tuner.release_h
+        z_rel = b["floor_z_m"] + self.tuner.release_h + slot["dz_m"]
         spd = self.tuner.speed(p["descend_speed_pct"])
         log.info("== place '%s' 상자 (놓는 높이 %.3fm, 하강 %.0f%%)", grade, self.tuner.release_h, spd)
         self.dash.mission("phase", phase="place")

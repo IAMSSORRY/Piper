@@ -418,7 +418,7 @@ class BoxRollWatcher:
 
     def verdict(self):
         """True=굴림, False=안 구름 또는 판정 불가."""
-        if self.t0 is None or self.before is None:
+        if self.t0 is None or (self.before is None and self.rc.get("mode") != "wrist"):
             return False
         if self._rec.is_set():
             rest = self.t0 + self.rc["window_s"] - time.monotonic()
@@ -456,31 +456,34 @@ class BoxRollWatcher:
         return rolled
 
     def _verdict_wrist(self):
-        """손목 카메라: 놓기 직전 그리퍼 아래 사과(가장 큰 덩어리)가 그리퍼를 연 뒤 얼마나 움직였나.
-        카메라가 사과 바로 위에 정지해 있으므로, 시야에서 사라지면 굴러 나간 것이다."""
-        if not self.before:
-            log.warning("손목 카메라: 놓기 직전 사과가 안 보임 → 굴림 판정 불가 (없음 처리)")
+        """손목 카메라: 그리퍼 연 뒤 사과가 떨어져 자리 잡은 시점(settle_from_s) 프레임과 마지막 프레임 사이의
+        화면 전체 이동량(위상 상관)으로 판정. 색과 무관 — 바로 위에서 보면 노란 사과는 채도가 빠져 색으로 못 찾는다."""
+        rc = self.rc
+        t_ref = self.t0 + rc.get("settle_from_s", 0.5)
+        frames = [(t, img) for t, _, img in self.track if t >= t_ref]
+        if len(frames) < 3:
+            log.warning("손목 카메라: 관찰 프레임 부족 (%d) → 판정 불가 (없음 처리)", len(frames))
             return False
-        if not self.track:
-            return False
-        ref = max(self.before, key=lambda b: b[2])
-        moved, lost = 0.0, False
-        for _, blobs, _ in self.track:
-            if not blobs:
-                lost = True
-                continue
-            lost = False
-            b = min(blobs, key=lambda b: math.hypot(b[0] - ref[0], b[1] - ref[1]))
-            moved = max(moved, math.hypot(b[0] - ref[0], b[1] - ref[1]))
-        out = self.track[-1][2].copy()
-        cv2.circle(out, (int(ref[0]), int(ref[1])), 10, (255, 255, 0), 2)
-        cv2.putText(out, f"moved {moved:.0f}px{' LOST' if lost else ''}", (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+
+        def gray(img):
+            g = cv2.cvtColor(cv2.resize(img, (160, 120)), cv2.COLOR_BGR2GRAY).astype(np.float32)
+            return cv2.GaussianBlur(g, (5, 5), 0)
+
+        win = cv2.createHanningWindow((160, 120), cv2.CV_32F)
+        g0 = gray(frames[0][1])
+        moved, diff = 0.0, 0.0
+        for _, img in frames[1:]:
+            g = gray(img)
+            (dx, dy), _ = cv2.phaseCorrelate(g0.copy(), g.copy(), win)   # ⚠ 창(win)을 주면 입력을 덮어쓴다 (OpenCV 4.5)
+            moved = max(moved, math.hypot(dx, dy) * 4.0)          # 160 → 640 px 환산
+            diff = max(diff, float(np.mean(np.abs(g - g0))))
+        out = frames[-1][1].copy()
+        cv2.putText(out, f"shift {moved:.0f}px diff {diff:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
         os.makedirs(os.path.join(HERE, "snapshots"), exist_ok=True)
         cv2.imwrite(os.path.join(HERE, "snapshots", time.strftime("%H%M%S_roll.jpg")), out)
-        rolled = lost or moved > self.rc["move_px"]
-        log.info("손목 카메라: 사과 이동 %.0fpx%s (기준 %dpx, %d프레임) → %s", moved, ", 시야 이탈" if lost else "",
-                 self.rc["move_px"], len(self.track), "굴림" if rolled else "안정")
+        rolled = moved > rc["move_px"] or diff > rc.get("diff_max", 18.0)
+        log.info("손목 카메라: 화면 이동 %.0fpx, 밝기 변화 %.1f (기준 %dpx / %.0f, %d프레임) → %s",
+                 moved, diff, rc["move_px"], rc.get("diff_max", 18.0), len(frames), "굴림" if rolled else "안정")
         return rolled
 
     def close(self):
