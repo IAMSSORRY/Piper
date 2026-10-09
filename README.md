@@ -91,13 +91,18 @@ SSORRY_TOKEN=<토큰> ~/.venvs/piper-daemons/bin/python mission.py --serve     #
 
 | 요청 | 동작 |
 |---|---|
-| `GET /status` | `{state, error, index, placed, results}` — state: idle / running / estopped / error / done |
+| `GET /status` | `{state, error, index, placed, results}` — state: idle / running / stopping(/park 정리 중) / estopped / error / done |
 | `POST /start` `{"apples": 5}` | 미션 시작 (`"all"` = 트레이가 빌 때까지, 생략 = config) |
-| `POST /estop` | 비상정지 |
+| `POST /estop` | **비상정지: 즉시 그 자리 정지 → 실제 비상정지** (~0.2초). 다른 명령을 기다리지 않고, 여러 번 눌러도 된다. `/park` 정리 중이면 정리를 버리고 바로 선다 |
+| `POST /park` | **정리 후 정지**: 그 자리 정지 → 쥔 사과를 집은 자리에 되돌림 → 팔을 낮게 → 실제 비상정지. 미션이 3초 안에 안 멈추면 정리 없이 즉시 비상정지 |
 | `POST /resume` | 비상정지(또는 오류 정지) 해제 → 모터 enable → **멈춘 사과부터 이어서** (칸별 개수·속도 조정 유지). 사과를 쥔 채 멈췄으면 트레이 가운데에 내려놓고 다시 찍는다 |
 | `POST /stop` | 지금 사과까지만 하고 멈춤 |
 
 - 헤더 `Authorization: Bearer <SSORRY_TOKEN>` (대시보드 ingest 토큰과 같은 값)
 - PIPER Studio 비상정지·힘 이상 정지로 멈춰도 state 가 estopped / error 가 되고 `/resume` 으로 이어진다
+- `/estop` 은 팔을 낮추지 않고 그 자리에 세운다. 높은 곳에서 모터가 정지하면 처질 수 있으니, 위급하지 않을 때는 `/park` 를 쓴다
+- 비상정지 상태에서 `/start` 는 거부된다 → `/resume` 먼저
+- (10-09 수정) 예전 `/estop` 은 정리 동작을 먼저 했는데, 집는 중이면 미션이 정지 요청을 '사과 건너뜀'으로 삼켜 계속 돌았고
+  8초 뒤 정리 동작이 미션과 **동시에** 팔을 움직였다 (실제 정지까지 ~19초). 열린 그리퍼도 '사과를 쥠'으로 오판해 되돌리기 동작을 했다
 - ⚠ 비상정지 해제(SDK `EmergencyStop(0x02)`) 순간 모터 전원이 잠깐 빠져 팔이 처질 수 있다 — 프론트에서 확인창을 띄울 것
 - 상태 변화는 대시보드에 `mission` 이벤트 `{"event": "control", "state": ..., "error": ...}` 로도 간다

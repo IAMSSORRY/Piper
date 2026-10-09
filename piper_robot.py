@@ -71,7 +71,11 @@ class _Contact(Exception):
 
 
 class SoftStop(RobotError):
-    """원격 비상정지 요청 — 하던 동작을 그 자리에서 멈춘다 (그 뒤 안전 자세로 옮기고 실제 비상정지)."""
+    """원격 정지 요청 — 하던 동작을 그 자리에서 멈춘다.
+
+    ⚠ RobotError 의 하위라서 `except RobotError` 가 삼키기 쉽다. 미션에서 RobotError 를 잡는 곳은
+    반드시 SoftStop 을 먼저 다시 올려야 한다 (예전에 '이 사과 건너뜀'으로 처리돼 미션이 계속 돌았다).
+    요청은 clear_soft_stop() 전까지 유지되므로 한 번 삼켜져도 다음 검사에서 다시 걸린다."""
     pass
 
 
@@ -146,6 +150,7 @@ class Robot:
         self.arm = None
         self._estopped = threading.Event()
         self._soft_stop = threading.Event()
+        self._soft_held = False   # 정지 요청 뒤 hold() 를 이미 보냈는가 (검사마다 다시 보내지 않게)
         self.jaw_yaw = None   # 집게가 닫히는 방향(로봇 xy 평면 각도, rad). None = 기본 자세 그대로
         fm = cfg.get("force_monitor", {})
         self.fm_on = bool(fm.get("enabled", False)) and not sim
@@ -252,9 +257,12 @@ class Robot:
         log.info("비상정지 해제 전송")
 
     def hold(self):
-        """현재 위치를 목표로 다시 보내 그 자리에 세운다 (전원 유지, 낙하 없음)."""
+        """현재 위치를 목표로 다시 보내 그 자리에 세운다 (전원 유지, 낙하 없음). 섰으면 True.
+
+        정지 명령을 못 보냈으면(CAN 오류 등) '섰다'고 가정하지 않고 실제 비상정지로 넘어간다.
+        """
         if self.arm is None or self._estopped.is_set():
-            return
+            return False
         try:
             x, y, z, rx, ry, rz = self.current_pose()
             for _ in range(3):
@@ -262,26 +270,39 @@ class Robot:
                 self.arm.EndPoseCtrl(m2sdk(x), m2sdk(y), m2sdk(z), rad2sdk(rx), rad2sdk(ry), rad2sdk(rz))
                 time.sleep(0.02)
             log.warning("현재 위치 정지 (%.3f, %.3f, %.3f)", x, y, z)
+            return True
         except Exception as e:
-            log.error("hold 실패: %s", e)
+            log.error("hold 실패 (%s) → 실제 비상정지", e)
+            self.estop()
+            return False
 
     # ---------- 상태 ----------
     def _status(self):
         return self.arm.GetArmStatus().arm_status
 
     def soft_stop(self):
+        """원격 정지 요청. 미션 스레드가 다음 검사(_check_fault, 10ms 간격)에서 그 자리에 서고 SoftStop 을 올린다."""
+        self._soft_held = False
         self._soft_stop.set()
 
     def clear_soft_stop(self):
+        """미션 스레드가 끝난 뒤에만 부른다 — 그 전에 지우면 삼켜진 요청이 사라진다."""
         self._soft_stop.clear()
+        self._soft_held = False
+
+    @property
+    def soft_stopped(self):
+        return self._soft_stop.is_set()
 
     def _check_fault(self, unreach=True):
         if self._estopped.is_set():
             raise RobotFault("비상정지됨")
         if self._soft_stop.is_set():
-            self._soft_stop.clear()
-            self.hold()
-            raise SoftStop("원격 비상정지 요청 — 그 자리 정지")
+            # 요청은 지우지 않는다(clear_soft_stop 전까지 유지) — 누가 SoftStop 을 삼켜도 다음 검사에서 다시 걸린다
+            if not self._soft_held:
+                self._soft_held = True
+                self.hold()
+            raise SoftStop("원격 정지 요청 — 그 자리 정지")
         st = self._status()
         code = int(st.arm_status)
         if code in UNREACHABLE_STATUS and not unreach:
@@ -342,6 +363,11 @@ class Robot:
     def current_joints(self):
         j = self.arm.GetArmJointMsgs().joint_state
         return [sdk2rad(v) for v in (j.joint_1, j.joint_2, j.joint_3, j.joint_4, j.joint_5, j.joint_6)]
+
+    def holding(self, min_width):
+        """사과를 쥐고 있는가: 마지막 그리퍼 명령이 '닫기'이고 닫힌 폭이 min_width 이상.
+        폭만 보면 열린 그리퍼(사과보다 넓다)도 '쥐고 있음'이 된다 (예전 safe_park / recover_held 오판)."""
+        return bool(getattr(self, "grip_closed", False)) and self.gripper_width() >= min_width
 
     def gripper_width(self):
         return sdk2m(self.arm.GetArmGripperMsgs().gripper_state.grippers_angle)
@@ -487,6 +513,8 @@ class Robot:
         effort = int(round(float(g["effort_nm"]) * 1000))
         timeout = timeout or float(g["timeout_s"])
         log.info("grip %s (목표 %.1fmm, 힘 %.1fN·m)", "open" if open_ else "close", width * 1000, effort / 1000)
+        # 마지막으로 보낸 그리퍼 명령. 열린 그리퍼도 폭은 넓으므로 '쥐고 있다'는 이것과 폭을 함께 본다 (holding)
+        self.grip_closed = not open_
         t0 = time.monotonic()
         last_send = -1.0
         last_w, still_since = None, None

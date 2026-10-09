@@ -24,7 +24,7 @@ import yaml
 
 from adaptive import AdaptiveTuner
 from dashboard import Dashboard
-from piper_robot import ForceStop, MotionTimeout, Robot, RobotError, RobotFault
+from piper_robot import ForceStop, MotionTimeout, Robot, RobotError, RobotFault, SoftStop
 
 log = logging.getLogger("mission")
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -374,16 +374,19 @@ class Mission:
             self.roll.release()              # 쥔 사과 위치 기억 + 관찰 시작
         margin = p.get("release_open_margin_m")
         self.r.grip(True, width=held + margin if margin is not None else None)   # 조금만 연다
+        self.last_pick = None                # 놓았다 — 여기서 멈춰도 되돌릴 사과가 없다
         self.r.wait(p["release_settle_s"])   # 팔 정지 상태로 관찰
         if self.roll and self.cfg["roll_camera"].get("mode") == "wrist":
             self.roll.stop()                 # 팔이 올라가기 전에 관찰 끝
         self.r.down_to(bx, by, z_lift, p["lift_speed_pct"])
 
     def safe_park(self):
-        """비상정지 직전 안전 동작: 사과를 쥐고 있으면 집었던 자리에 되돌려 놓고, 팔을 낮은 쉬는 자세로 내린다."""
+        """정리 후 정지(/park): 사과를 쥐고 있으면 집었던 자리에 되돌려 놓고, 팔을 낮은 쉬는 자세로 내린다.
+        사과를 되돌렸으면 True."""
+        returned = False
         p, c = self.cfg["pick"], self.cfg
         spd = c.get("estop", {}).get("speed_pct", 30)
-        if self.r.gripper_width() >= c["gripper"]["min_grasp_width_m"]:
+        if self.r.holding(c["gripper"]["min_grasp_width_m"]):
             if self.last_pick:
                 x, y, jaw = self.last_pick
             else:
@@ -399,6 +402,7 @@ class Mission:
             self.r.down_to(x, y, max(self.r.lift_z(x, y), z + 0.05), spd)
             self.r.jaw_yaw = None
             self.last_pick = None
+            returned = True
         # 팔 내리기: 쉬는 자세 (낮게 — 모터 전원이 빠져도 덜 떨어진다)
         rx, ry = c.get("estop", {}).get("rest_xy_m", c["home_xy_m"])
         rz = c.get("estop", {}).get("rest_tip_z_m", 0.17)
@@ -406,10 +410,11 @@ class Mission:
         self.dash.mission("phase", phase="estop_rest")
         self.r.transit_to(rx, ry, spd)
         self.r.down_to(rx, ry, rz + self.r.tool_len, spd)
+        return returned
 
     def recover_held(self):
         """이어하기 전: 사과를 쥔 채 멈췄으면 트레이 가운데에 살살 내려놓는다 (다시 찍어서 처음부터 집는다)."""
-        if self.r.gripper_width() < self.cfg["gripper"]["min_grasp_width_m"]:
+        if not self.r.holding(self.cfg["gripper"]["min_grasp_width_m"]):
             self.r.grip(True)
             return
         p = self.cfg["pick"]
@@ -482,8 +487,8 @@ class Mission:
                     if xy is None:
                         break
                     continue
-                except (RobotFault, MotionTimeout, ForceStop):
-                    raise
+                except (RobotFault, MotionTimeout, ForceStop, SoftStop):
+                    raise   # 정지 요청·고장은 '이 사과 건너뜀'이 아니다 — 미션을 멈춘다
                 except RobotError as e:   # 관절 해 없음·작업영역 밖 → 이 사과만 건너뛴다
                     log.error("사과 %d 건너뜀: %s", i + 1, e)
                     self.dash.mission("skip", index=i + 1, reason=str(e))
