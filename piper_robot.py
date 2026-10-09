@@ -326,7 +326,7 @@ class Robot:
             time.sleep(0.02)
 
     # ---------- 동작 ----------
-    def _run_until(self, send, done, timeout, what, near=None, progress=None):
+    def _run_until(self, send, done, timeout, what, near=None, progress=None, tick=None):
         """명령은 처음 SEND_BURST_S 동안만 보낸다 — 계속 보내면 PIPER 가 매번 궤적을 새로 시작해서 뚝뚝 끊긴다.
         멈춘 채(progress 변화 없음) STALL_RESEND_S 가 지나면 한 번 더 보낸다.
         도착: done() (엄격) 또는 near() 가 NEAR_HOLD_S 동안 유지 (로봇이 '도착'이라는데 몇 mm 모자랄 때)."""
@@ -338,18 +338,20 @@ class Robot:
         self._fm_reset()
         try:
             return self._run_loop(send, done, timeout, what, near, progress, t0, last_send, last_prog, last_prog_t,
-                                  near_since, resend_until)
+                                  near_since, resend_until, tick)
         finally:
             if self.fm_on:
                 log.debug("%s 부하 최대 편차 %s", what, " ".join(f"{v:.2f}" for v in self.fm_peak))
                 self.fm_log.append((what, list(self.fm_peak)))
 
     def _run_loop(self, send, done, timeout, what, near, progress, t0, last_send, last_prog, last_prog_t,
-                  near_since, resend_until):
+                  near_since, resend_until, tick=None):
         while True:
             now = time.monotonic()
             self._check_fault(unreach=now - t0 >= 0.3)
             self._check_force()
+            if tick is not None:
+                tick()
             if now < resend_until and now - last_send >= RESEND_PERIOD_S:
                 send()
                 last_send = now
@@ -418,7 +420,7 @@ class Robot:
             raise MotionTimeout(f"{e} — 현재 ({p[0]:.3f},{p[1]:.3f},{p[2]:.3f}), "
                                 f"남은 거리 {math.dist(p[:3], target) * 1000:.1f}mm{hint}")
 
-    def move_joints(self, joints, speed_pct, timeout=None):
+    def move_joints(self, joints, speed_pct, timeout=None, tick=None):
         """관절 각도[rad] 6개로 이동 (MOVE J). 도착까지 블로킹."""
         if len(joints) != 6:
             raise RobotError("관절 각도는 6개여야 합니다")
@@ -444,7 +446,7 @@ class Robot:
                     and int(self._status().motion_status) == 0)
 
         self._run_until(send, done, timeout or self.timeout, "move_joints", near=near,
-                        progress=lambda: max(abs(a - b) for a, b in zip(self.current_joints(), joints)))
+                        progress=lambda: max(abs(a - b) for a, b in zip(self.current_joints(), joints)), tick=tick)
 
     def grip(self, open_, timeout=None, width=None):
         """그리퍼 열기(True)/닫기(False). 목표 폭 도달 또는 멈춤(사과에 막힘)까지 블로킹. 최종 폭[m] 반환.

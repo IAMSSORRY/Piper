@@ -50,7 +50,8 @@ workspace:
   max_reach_xy_m: 0.56      # 수평 거리 상한. 0.545 에서도 파지 기울기 12° (19:31 계산). 진짜 기준은 관절 해가 있느냐 — 없으면 그 사과만 건너뜀
 
 motion:
-  transit_speed_pct: 40      # 빈 공중 이동
+  transit_speed_pct: 70      # 공중 이동·검사·홈 (빠르게). 21:45 40 → 70
+  approach_speed_pct: 50     # 잡기/놓기 직전 구간 위까지 내려가기
   move_timeout_s: 15.0       # 동작 하나당 최대 시간. 넘으면 그 자리 정지 후 종료
   pos_tol_m: 0.004           # 도착 판정 거리 오차
   joint_tol_rad: 0.02        # 도착 판정 관절 오차
@@ -72,7 +73,7 @@ pick:
   grasp_height_m: 0.030      # 바닥 위 손가락 끝 높이 ≈ 사과 반지름 (사과 지름 ~64mm) ★
   approach_height_m: 0.10    # 바닥 위 접근 높이 (사과 높이 64mm + 여유). 여기까지 빠르게, 그다음 천천히
   descend_speed_pct: 20      # 하강 속도 (적응형 조정 대상)
-  lift_speed_pct: 25         # 쥐고 올라가는 속도
+  lift_speed_pct: 50         # 쥐고 올라가는 속도. 21:45 25 → 50
   retries: 1                 # 못 집었을 때 재시도 횟수
   grasp_offset_m: [-0.010, 0.0]  # 잡는 위치 미세 보정 [x, y] m. +x = Sony 화면 아래, +y = 화면 오른쪽. 19:32 "화면상 살짝 위로" → -1cm ★
 
@@ -82,8 +83,9 @@ pick:
 inspect:
   mode: rotate
   joints_rad: [-0.112, 0.791, -0.997, 0.184, 0.181, -0.214]   # ★
-  sweep_j6_rad: [-1.75, -0.87, 0.0, 0.87, 1.75]                # 손목 -100° ~ +100°
-  sweep_speed_pct: 30
+  sweep_j6_rad: [-1.75, 1.75]   # 손목 -100° → +100° 한 번에 돌리면서 frame_period_s 마다 찍는다 (21:45)
+  frame_period_s: 0.12
+  sweep_speed_pct: 40        # 너무 빠르면 사진이 흐려진다 ★
   settle_s: 0.3
   xy_m: [0.25, 0.0]          # mode 가 rotate 가 아닐 때 이동 높이에서 이 위치
   wait_s: 1.5
@@ -109,7 +111,8 @@ boxes:
 place:
   descend_speed_pct: 20      # 상자 안으로 내려가는 속도 (적응형 조정 대상)
   release_height_m: 0.04     # 상자 바닥 위 놓는 높이 (적응형 조정 대상). 사과 아래면이 바닥에 닿을 정도가 이상적
-  release_settle_s: 1.2      # 그리퍼 연 뒤 정지 대기 (사과 안정 + 손목 카메라 굴림 관찰)
+  release_settle_s: 0.6      # 그리퍼 연 뒤 정지 대기 (사과 안정 + 굴림 관찰). 21:45 1.2 → 0.6
+  slow_zone_m: 0.04          # 놓는 높이 위 이 구간만 느리게 (descend_speed_pct)
   # 칸 안 자리 (칸 중심 기준). 칸이 사과 크기(77mm)이고 그리퍼 몸통(180mm)이 칸 폭(195mm)에 꽉 차서
   # 가운데에 쌓는다 (20:55 결정). dz = 아래 사과 지름(최대 ~80mm) + 5mm 씩 위에서 놓는다 ★
   slots:
@@ -119,7 +122,7 @@ place:
   place_jaw_yaw_deg: 90      # 칸에 놓을 때 그리퍼를 가로로 (Sony 화면 좌우 = 칸 긴 쪽 20cm). 20:38 세로(0°)로 놓다가 그리퍼 몸통이 칸 벽을 눌렀다
   release_open_margin_m: 0.012  # 놓을 때 쥔 폭 + 이만큼만 연다 (활짝 열면 손가락이 벽·옆 사과를 친다)
   drop_max_m: 0.010          # 놓을 때 이보다 많이 떨어지면 '낙하' (손목 카메라 크기비로 측정) ★
-  lift_speed_pct: 30
+  lift_speed_pct: 60
 
 # 굴림 신호 → 하강 속도·놓는 높이 20% 하향
 adaptive:
@@ -228,7 +231,7 @@ roll_camera:
   match_px: 30               # 놓기 전부터 있던 사과로 볼 거리
   move_px: 25                # wrist: 사과가 자리 잡은 뒤 화면 전체가 이만큼 넘게 밀리면 굴림 (640x480 기준) ★
   diff_max: 18.0             # wrist: 평균 밝기 변화가 이보다 크면 굴림 (사과가 시야에서 빠짐) ★
-  settle_from_s: 0.5         # wrist: 그리퍼 연 뒤 이 시점부터 비교 (사과 떨어지는 1cm 는 무시)
+  settle_from_s: 0.25        # wrist: 그리퍼 연 뒤 이 시점부터 비교 (사과 떨어지는 순간은 무시). release_settle_s 보다 작게
   cam_to_apple_top_m: 0.07   # wrist: 쥐고 있을 때 손목 카메라 → 사과 윗면 거리 (화면 폭 대비 사과 크기로 추정) ★
   window_s: 1.0              # box 모드 관찰 시간 (wrist 모드는 place.release_settle_s 동안)
 

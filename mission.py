@@ -209,8 +209,8 @@ class Mission:
         self.dash.mission("phase", phase="pick")
         self.r.transit_to(x, y, c["motion"]["transit_speed_pct"])
         self.r.grip(True, width=open_w)
-        self.r.down_to(x, y, z_app, c["motion"]["transit_speed_pct"])
-        self.r.down_to(x, y, z_grasp, self.tuner.speed(p["descend_speed_pct"]))
+        self.r.down_to(x, y, z_app, c["motion"]["approach_speed_pct"])
+        self.r.down_to(x, y, z_grasp, self.tuner.speed(p["descend_speed_pct"]))   # 잡기 직전만 느리게
         w = self.r.grip(False)
         min_w = c["gripper"]["min_grasp_width_m"]
         ok = w >= min_w
@@ -268,14 +268,29 @@ class Mission:
         i = self.cfg["inspect"]
         log.info("== inspect")
         self.dash.mission("phase", phase="inspect")
-        if i.get("mode") == "rotate" and hasattr(self.sig, "inspect_frame"):
+        low = grade_labels(self.cfg)[1]
+        if i.get("mode") == "rotate" and hasattr(self.sig, "inspect_frame") and self.sig.grade() == low:
+            log.info("노란 사과 → %s (회전 검사 생략)", low)   # 멍과 상관없이 낮은 등급
+            g = self.sig.final_grade()
+        elif i.get("mode") == "rotate" and hasattr(self.sig, "inspect_frame"):
             q = [float(v) for v in i["joints_rad"]]
+            a, b = (float(v) for v in i["sweep_j6_rad"])
+            cur6 = self.r.current_joints()[5]
+            if abs(cur6 - b) < abs(cur6 - a):     # 지금 손목에서 가까운 끝부터
+                a, b = b, a
             self.sig.bruises = []
-            self.r.move_joints(q, self.cfg["motion"]["transit_speed_pct"])
-            for k, q6 in enumerate(i["sweep_j6_rad"]):
-                self.r.move_joints(q[:5] + [float(q6)], i.get("sweep_speed_pct", 30))
-                self.r.wait(i.get("settle_s", 0.3))
-                self.sig.inspect_frame(f"{k}")
+            self.r.move_joints(q[:5] + [a], self.cfg["motion"]["transit_speed_pct"])
+            last = [0.0]
+            period = i.get("frame_period_s", 0.12)
+
+            def snap():                           # 돌리는 동안 일정 간격으로 찍는다 (멈추지 않는다)
+                now = time.monotonic()
+                if now - last[0] >= period:
+                    last[0] = now
+                    self.sig.inspect_frame(f"{len(self.sig.bruises)}")
+
+            snap()
+            self.r.move_joints(q[:5] + [b], i.get("sweep_speed_pct", 40), tick=snap)
             g = self.sig.final_grade()
         else:
             x, y = i["xy_m"]
@@ -308,6 +323,9 @@ class Mission:
         log.info("== place '%s' 상자 (놓는 높이 %.3fm, 하강 %.0f%%)", grade, self.tuner.release_h, spd)
         self.dash.mission("phase", phase="place")
         self.r.transit_to(bx, by, self.cfg["motion"]["transit_speed_pct"])
+        slow = p.get("slow_zone_m", 0.04)               # 놓기 직전 이 구간만 느리게
+        if z_lift > z_rel + slow:
+            self.r.down_to(bx, by, z_rel + slow, self.cfg["motion"]["approach_speed_pct"])
         self.r.down_to(bx, by, z_rel, spd)
         held = self.r.gripper_width()
         if held < self.cfg["gripper"]["min_grasp_width_m"]:   # 운반 중에 떨어뜨렸다
@@ -347,8 +365,7 @@ class Mission:
         self.r.go_home()
         clear = getattr(self.sig, "needs_clear_view", False)   # 카메라: 찍기 전에 팔을 시야 밖(홈)으로
         for i in range(n):
-            if clear and i:
-                self.r.go_home()
+            # 홈 복귀 없음: 놓고 올라온 팔은 상자 위라 트레이를 가리지 않는다 (사과 하나에 ~2초)
             xy = self.sig.apple_xy(i)
             if xy is None:
                 log.info("사과 좌표 없음 → 종료")
@@ -396,8 +413,6 @@ class Mission:
             grade = self.inspect()
             self.dash.judge(grade, getattr(self.sig, "judge_info", lambda: None)())
             self.place(grade)
-            if clear:
-                self.r.go_home()
             self.r.jaw_yaw = None
             rolled = self.roll.verdict() if self.roll else self.sig.rolled(grade)
             drop_m = getattr(self.roll, "last_drop_m", None) if self.roll else None
