@@ -408,8 +408,10 @@ class BoxRollWatcher:
         self._rec.clear()
 
     def release(self):
+        self.before_img, self.last_drop_m = None, None
         try:
             img = self.cam.latest(timeout=1.0)
+            self.before_img = img
             self.before = color_blobs(img, self.rc)
         except IOError as e:
             log.warning("상자 카메라: %s", e)
@@ -482,10 +484,43 @@ class BoxRollWatcher:
         cv2.putText(out, f"shift {moved:.0f}px diff {diff:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
         os.makedirs(os.path.join(HERE, "snapshots"), exist_ok=True)
         cv2.imwrite(os.path.join(HERE, "snapshots", time.strftime("%H%M%S_roll.jpg")), out)
+        self.last_drop_m = self._drop_from_scale(self.before_img, frames[-1][1]) if self.before_img is not None else None
         rolled = moved > rc["move_px"] or diff > rc.get("diff_max", 18.0)
         log.info("손목 카메라: 화면 이동 %.0fpx, 밝기 변화 %.1f (기준 %dpx / %.0f, %d프레임) → %s",
                  moved, diff, rc["move_px"], rc.get("diff_max", 18.0), len(frames), "굴림" if rolled else "안정")
         return rolled
+
+    def _drop_from_scale(self, before, after):
+        """놓기 직전(쥐고 있을 때)과 놓은 뒤 화면의 '가운데(사과) 크기 비'로 낙하 거리 추정.
+        사과가 떨어지면 카메라에서 멀어져 작아 보인다: 거리 D → D+Δ 이면 크기비 s = D/(D+Δ), Δ = D(1/s - 1)."""
+        D = float(self.rc.get("cam_to_apple_top_m", 0.07))
+
+        def crop(img):
+            g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            h, w = g.shape
+            return g[int(h * 0.2):int(h * 0.8), int(w * 0.2):int(w * 0.8)]
+
+        a, b = crop(before), crop(after)
+        orb = cv2.ORB_create(1500)
+        ka, da = orb.detectAndCompute(a, None)
+        kb, db = orb.detectAndCompute(b, None)
+        if da is None or db is None or len(ka) < 20 or len(kb) < 20:
+            log.warning("손목 카메라: 낙하 측정 실패 (특징점 부족)")
+            return None
+        m = sorted(cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True).match(da, db), key=lambda x: x.distance)[:300]
+        if len(m) < 15:
+            log.warning("손목 카메라: 낙하 측정 실패 (매칭 %d개)", len(m))
+            return None
+        pa = np.float32([ka[x.queryIdx].pt for x in m])
+        pb = np.float32([kb[x.trainIdx].pt for x in m])
+        M, inl = cv2.estimateAffinePartial2D(pa, pb, ransacReprojThreshold=3)
+        if M is None or inl is None or inl.sum() < 12:
+            log.warning("손목 카메라: 낙하 측정 실패 (일관된 매칭 부족)")
+            return None
+        sc = math.hypot(M[0, 0], M[1, 0])
+        drop = max(0.0, D * (1.0 / sc - 1.0))
+        log.info("손목 카메라: 사과 크기비 %.3f → 낙하 약 %.0fmm (인라이어 %d)", sc, drop * 1000, int(inl.sum()))
+        return drop
 
     def close(self):
         self.cam.close()
@@ -500,6 +535,29 @@ def open_roll_watcher(cfg):
     except Exception as e:
         log.warning("상자 카메라 열기 실패 (%s) → 위 카메라로 굴림 판정", e)
         return None
+
+
+# ---------- 트레이 위치 (사진으로, 매번) ----------
+
+def find_tray_floor(bgr, cfg):
+    """청록 트레이를 찾아 '바닥 가장자리' 사각형(픽셀 4점)을 돌려준다. 윗테두리에서 wall_inset_px 만큼 안쪽.
+    (테두리는 바닥보다 높아 위에서 보면 바깥으로 보인다 — 벽 여유를 크게 잡는 실수를 막는다.) 못 찾으면 None."""
+    t = cfg["vision"]["tray"]
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    h, s, v = cv2.split(hsv)
+    lo, hi = t["hue"]
+    m = ((h >= lo) & (h <= hi) & (s >= t["sat_min"]) & (v >= t["val_min"])).astype(np.uint8) * 255
+    m &= _roi_mask(bgr.shape, t["search_roi_px"])
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (41, 41)))
+    cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return None
+    c = max(cnts, key=cv2.contourArea)
+    if cv2.contourArea(c) < t["min_area_px"]:
+        return None
+    (cx, cy), (w, hh), ang = cv2.minAreaRect(c)
+    k = t["wall_inset_px"]
+    return cv2.boxPoints(((cx, cy), (max(1.0, w - 2 * k), max(1.0, hh - 2 * k)), ang))
 
 
 # ---------- 상자 위치 (사진으로) ----------
@@ -590,6 +648,14 @@ class CameraSignals:
     def apple_xy(self, i):
         img = self.cam.latest(after=time.monotonic() + self.v["settle_s"])
         self.box_img = img
+        floor = find_tray_floor(img, self.cfg)
+        if floor is not None:   # 트레이가 밀려도 따라간다
+            poly = [self.calib.px2xy(u, v) for u, v in floor]
+            self.tray_walls = [(*poly[i], *poly[(i + 1) % 4]) for i in range(4)]
+            self.tray_center = tuple(np.mean(poly, axis=0))
+        else:
+            log.warning("트레이를 사진에서 못 찾음 → 설정의 tray_roi_px 로 벽 계산")
+            self.tray_walls, self.tray_center = None, None
         apples = apply_calib(detect_apples(img, self.cfg), self.calib)
         ws = self.cfg["workspace"]
         ok = [a for a in apples if ws["x"][0] <= a.x <= ws["x"][1] and ws["y"][0] <= a.y <= ws["y"][1]
@@ -633,9 +699,12 @@ class CameraSignals:
         """집게 방향 고르기용: 이 사과 반지름, 이웃 사과 [(x, y, r)], 트레이 안쪽 벽 선분 (로봇 좌표)."""
         if self.cur is None:
             return None
-        poly = [self.calib.px2xy(u, v) for u, v in self.v["tray_roi_px"]]
-        walls = [(*poly[i], *poly[(i + 1) % len(poly)]) for i in range(len(poly))]
-        return {"r": self.cur.d_m / 2, "others": self.cur_others, "walls": walls}
+        walls, center = getattr(self, "tray_walls", None), getattr(self, "tray_center", None)
+        if walls is None:
+            poly = [self.calib.px2xy(u, v) for u, v in self.v["tray_roi_px"]]
+            walls = [(*poly[i], *poly[(i + 1) % len(poly)]) for i in range(len(poly))]
+            center = tuple(np.mean(poly, axis=0))
+        return {"r": self.cur.d_m / 2, "others": self.cur_others, "walls": walls, "center": center}
 
     def judge_info(self):
         """대시보드용 판정 근거: 빨강 비율 vs 임계값, 위 카메라 픽셀 bbox."""

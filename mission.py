@@ -136,6 +136,16 @@ class ManualSignals:
 
 # ---------- 시퀀스 ----------
 
+class NeedRedetect(Exception):
+    """사과를 굴려서 옮겼다 — 다시 찍고 다시 집는다."""
+
+
+def _seg_dist(px, py, x1, y1, x2, y2):
+    dx, dy = x2 - x1, y2 - y1
+    t = max(0.0, min(1.0, ((px - x1) * dx + (py - y1) * dy) / (dx * dx + dy * dy or 1e-12)))
+    return math.hypot(px - (x1 + t * dx), py - (y1 + t * dy))
+
+
 def best_jaw_yaw(x, y, apple_r, open_w, finger_w, obstacles, walls):
     """집게 두 손가락이 내려앉을 자리의 여유가 가장 큰 방향(rad)과 그 여유(m).
     obstacles: [(x, y, r)] 이웃 사과, walls: [(x1, y1, x2, y2)] 트레이 안쪽 벽 선분."""
@@ -165,6 +175,7 @@ class Mission:
         self.r, self.cfg, self.tuner, self.sig = robot, cfg, tuner, signals
         self.dash = dash or Dashboard({})
         self.placed = {}      # 칸별 놓은 개수
+        self.last_drop = None  # 운반 중 낙하 표시
         self.roll = roll      # 굴림 카메라 (vision.BoxRollWatcher). 없으면 signals.rolled()
 
     def pick(self, x, y):
@@ -182,6 +193,11 @@ class Mission:
         if ctx and g.get("auto_jaw", True):
             th, clear = best_jaw_yaw(ax, ay, ctx["r"], open_w, g["finger_width_m"],
                                      ctx["others"], ctx["walls"])
+            nd = c.get("nudge", {})
+            if nd.get("enabled", True) and clear < nd.get("min_clearance_m", 0.010) and self._nudges < nd.get("max_per_apple", 2):
+                log.warning("손가락 여유 %.0fmm — 벽에 붙은 사과. 가운데로 살짝 굴린 뒤 다시 집는다", clear * 1000)
+                self._nudge(ax, ay, ctx)
+                raise NeedRedetect()
             self.r.jaw_yaw = th
             (log.warning if clear < 0.005 else log.info)(
                 "집게 방향 %.0f° (손가락 여유 %.0fmm%s)", math.degrees(th), clear * 1000,
@@ -205,6 +221,47 @@ class Mission:
         log.info("파지 %s (폭 %.1fmm)", "성공" if ok else "실패", w * 1000)
         self.dash.mission("pick", ok=bool(ok), attempt=getattr(self, "_attempt", 0), width_mm=round(w * 1000, 1))
         return ok
+
+    def _nudge(self, ax, ay, ctx):
+        """벽에 붙은 사과를 가운데 쪽으로 굴린다: 닫은 손가락으로 사과 윗면의 벽 쪽을 살짝 누르고 가운데로 민다."""
+        self._nudges += 1
+        nd, p = self.cfg.get("nudge", {}), self.cfg["pick"]
+        r = ctx["r"]
+        # 벽에서 멀어지는 방향 = 가까운 벽들의 안쪽 법선 합 (없으면 트레이 가운데 쪽)
+        cx, cy = ctx["center"]
+        dx = dy = 0.0
+        for x1, y1, x2, y2 in ctx["walls"]:
+            if _seg_dist(ax, ay, x1, y1, x2, y2) < r + 0.03:
+                nx, ny = -(y2 - y1), (x2 - x1)
+                n = math.hypot(nx, ny) or 1.0
+                nx, ny = nx / n, ny / n
+                if (cx - x1) * nx + (cy - y1) * ny < 0:   # 안쪽을 향하게
+                    nx, ny = -nx, -ny
+                dx, dy = dx + nx, dy + ny
+        if math.hypot(dx, dy) < 1e-6:
+            dx, dy = cx - ax, cy - ay
+        n = math.hypot(dx, dy)
+        dx, dy = dx / n, dy / n
+        off, push = nd.get("contact_offset_m", 0.012), nd.get("push_m", 0.035)
+        px, py = ax - dx * off, ay - dy * off                       # 윗면의 벽 쪽
+        z_top = p["tray_z_m"] + 2 * r                               # 손가락끝이 사과 꼭대기에 닿는 플랜지 z
+        z_touch = z_top - nd.get("press_m", 0.002)
+        spd = nd.get("speed_pct", 10)
+        log.info("굴리기: 사과 (%.3f, %.3f) → 방향 (%.2f, %.2f) %.0fmm", ax, ay, dx, dy, push * 1000)
+        self.dash.mission("phase", phase="nudge")
+        self.r.jaw_yaw = math.atan2(dx, -dy)                        # 손가락이 미는 방향과 직각으로 나란히
+        self.r.grip(False)
+        self.r.transit_to(px, py, self.cfg["motion"]["transit_speed_pct"])
+        try:
+            self.r.down_to(px, py, z_top + 0.03, self.cfg["motion"]["transit_speed_pct"])
+            self.r.down_to(px, py, z_touch, spd)
+            self.r.down_to(px + dx * push, py + dy * push, z_touch, spd)
+        except ForceStop as e:   # 굴리다 걸리면 거기서 멈추고 들어 올린다 (미션은 계속)
+            log.warning("굴리기 중 힘 감지 — 멈추고 올린다: %s", e)
+            self.r.hold()
+        x, y = self.r.current_pose()[:2]
+        self.r.down_to(x, y, z_top + 0.04, spd)
+        self.r.jaw_yaw = None
 
     def inspect(self):
         """검사 위치로 이동 후 카메라 촬영 대기. 등급 반환."""
@@ -242,10 +299,16 @@ class Mission:
         self.dash.mission("phase", phase="place")
         self.r.transit_to(bx, by, self.cfg["motion"]["transit_speed_pct"])
         self.r.down_to(bx, by, z_rel, spd)
+        held = self.r.gripper_width()
+        if held < self.cfg["gripper"]["min_grasp_width_m"]:   # 운반 중에 떨어뜨렸다
+            log.error("낙하: 상자에 가는 동안 사과를 놓쳤습니다 (그리퍼 폭 %.0fmm)", held * 1000)
+            self.dash.mission("drop", where="운반 중", width_mm=round(held * 1000, 1))
+            self.last_drop = "운반 중"
+            self.r.down_to(bx, by, z_lift, p["lift_speed_pct"])
+            return
         if self.roll:
             self.roll.release()              # 쥔 사과 위치 기억 + 관찰 시작
         margin = p.get("release_open_margin_m")
-        held = self.r.gripper_width()
         self.r.grip(True, width=held + margin if margin is not None else None)   # 조금만 연다
         self.r.wait(p["release_settle_s"])   # 팔 정지 상태로 관찰
         if self.roll and self.cfg["roll_camera"].get("mode") == "wrist":
@@ -283,12 +346,20 @@ class Mission:
             log.info("######## 사과 %d/%d ########", i + 1, n)
             self.dash.mission("apple", index=i + 1, total=n)
             ok = False
-            for attempt in range(1 + retries):
+            self._nudges = 0
+            attempt = 0
+            while attempt < 1 + retries:
                 self._attempt = attempt
                 if attempt:
                     log.warning("재시도 %d/%d", attempt, retries)
                 try:
                     ok = self.pick(*xy)
+                except NeedRedetect:            # 굴렸다 → 다시 찍고 다시 (시도 횟수로 안 센다)
+                    self.r.go_home()
+                    xy = self.sig.apple_xy(i)
+                    if xy is None:
+                        break
+                    continue
                 except (RobotFault, MotionTimeout, ForceStop):
                     raise
                 except RobotError as e:   # 관절 해 없음·작업영역 밖 → 이 사과만 건너뛴다
@@ -300,8 +371,9 @@ class Mission:
                     break
                 if ok:
                     break
+                attempt += 1
                 self.r.grip(True)
-                if clear and attempt < retries:   # 재시도는 다시 찍어서 (사과가 밀렸을 수 있다)
+                if clear and attempt < 1 + retries:   # 재시도는 다시 찍어서 (사과가 밀렸을 수 있다)
                     self.r.go_home()
                     xy = self.sig.apple_xy(i) or xy
             if not ok:
@@ -318,6 +390,14 @@ class Mission:
                 self.r.go_home()
             self.r.jaw_yaw = None
             rolled = self.roll.verdict() if self.roll else self.sig.rolled(grade)
+            drop_m = getattr(self.roll, "last_drop_m", None) if self.roll else None
+            dropped = self.last_drop is not None or (drop_m is not None and drop_m > self.cfg["place"].get("drop_max_m", 0.010))
+            if drop_m is not None:
+                self.dash.mission("drop_measure", index=i + 1, drop_mm=round(drop_m * 1000, 1), dropped=bool(dropped))
+            if dropped:
+                log.warning("낙하 감지 (%s)", self.last_drop or f"놓을 때 약 {drop_m * 1000:.0f}mm")
+                rolled = True                  # 적응형 조정은 굴림과 같이 다룬다
+            self.last_drop = None
             # 이번 놓기에 실제로 쓴 값 (tuner 갱신 전)
             self.dash.motion(self.tuner.scale, self.tuner.release_h, rolled)
             if rolled:
