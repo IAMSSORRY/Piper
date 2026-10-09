@@ -22,7 +22,7 @@ import numpy as np
 import yaml
 
 from mission import _ask, load_config
-from piper_robot import MotionTimeout, Robot, RobotError, RobotFault
+from piper_robot import ForceStop, MotionTimeout, Robot, RobotError, RobotFault
 from vision import Calib, apply_calib, calib_path, detect_apples, draw, open_camera
 
 log = logging.getLogger("calib")
@@ -164,7 +164,7 @@ def run_auto(robot, cfg, obs):
         try:   # 내려가다 '도달 불가'면 이 점만 건너뛴다 (사과는 아직 쥐고 있다)
             robot.down_to(x, y, app(x, y), fast)
             robot.down_to(x, y, z_put, slow)
-        except (RobotFault, MotionTimeout):
+        except (RobotFault, MotionTimeout, ForceStop):
             raise
         except RobotError as e:
             log.warning("점 %d 건너뜀 (%s)", i + 1, e)
@@ -253,7 +253,7 @@ def run_verify(robot, cfg):
                 robot.transit_to(a.x, a.y, cfg["motion"]["transit_speed_pct"])
                 robot.down_to(a.x, a.y, z, cfg["pick"]["descend_speed_pct"])
             except RobotError as e:
-                if isinstance(e, RobotFault):
+                if isinstance(e, (RobotFault, ForceStop)):
                     raise
                 log.warning("건너뜀: %s", e)
                 continue

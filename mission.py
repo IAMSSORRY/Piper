@@ -23,7 +23,7 @@ import yaml
 
 from adaptive import AdaptiveTuner
 from dashboard import Dashboard
-from piper_robot import MotionTimeout, Robot, RobotError, RobotFault
+from piper_robot import ForceStop, MotionTimeout, Robot, RobotError, RobotFault
 
 log = logging.getLogger("mission")
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -38,10 +38,15 @@ def load_config(path):
     missing = [k for k in REQUIRED if k not in cfg]
     if missing:
         sys.exit(f"config 에 항목이 없습니다: {missing} ({path})")
-    for g in ("상", "중"):
+    for g in grade_labels(cfg):
         if g not in cfg["boxes"]:
             sys.exit(f"config boxes 에 '{g}' 구역이 없습니다")
     return cfg
+
+
+def grade_labels(cfg):
+    """[높은 등급, 낮은 등급] — 빨강 → 앞, 노랑 → 뒤. 지금은 상 / 하 (상자 상·중·하 중 두 칸만 쓴다)."""
+    return list(cfg["vision"]["grade"].get("labels", ["상", "중"]))
 
 
 def resolve_boxes(cfg, sim):
@@ -71,6 +76,7 @@ def resolve_boxes(cfg, sim):
 
 class SimSignals:
     def __init__(self, cfg):
+        self.labels = grade_labels(cfg)
         self.rng = random.Random(cfg["sim"]["seed"] + 1)
         self.apples = [tuple(p) for p in cfg["sim"]["apples_xy_m"]]
         self.roll_prob = cfg["sim"]["roll_prob"]
@@ -79,7 +85,7 @@ class SimSignals:
         return self.apples[i] if i < len(self.apples) else None
 
     def grade(self):
-        g = self.rng.choice(["상", "중"])
+        g = self.rng.choice(self.labels)
         log.info("[SIM] 카메라 등급 판정: %s", g)
         return g
 
@@ -103,6 +109,7 @@ class ManualSignals:
     """카메라 연동 전 현장 테스트용: 운영자가 터미널에 입력."""
 
     def __init__(self, cfg):
+        self.labels = grade_labels(cfg)
         self.defaults = [tuple(p) for p in cfg["sim"]["apples_xy_m"]]
 
     def apple_xy(self, i):
@@ -118,8 +125,9 @@ class ManualSignals:
         return self.defaults[i] if i < len(self.defaults) else None
 
     def grade(self):
-        s = _ask("등급 입력 (1=상, 2=중)", 20)
-        return {"1": "상", "상": "상", "2": "중", "중": "중"}.get(s or "")
+        hi, lo = self.labels
+        s = _ask(f"등급 입력 (1={hi}, 2={lo})", 20)
+        return {"1": hi, hi: hi, "2": lo, lo: lo}.get(s or "")
 
     def rolled(self, grade=None):
         s = _ask("굴림 있었나? (y/N)", 10)
@@ -207,7 +215,7 @@ class Mission:
         self.r.transit_to(x, y, self.cfg["motion"]["transit_speed_pct"])
         self.r.wait(i["wait_s"])
         g = self.sig.grade()
-        if g not in ("상", "중"):
+        if g not in grade_labels(self.cfg):
             log.warning("등급 신호 없음/오류 (%r) → 기본 등급 %s", g, i["default_grade"])
             g = i["default_grade"]
         return g
@@ -248,6 +256,19 @@ class Mission:
         results = []
         t0 = time.monotonic()
         self.dash.mission("start", apple_count=n, sim=bool(getattr(self.r, "sim", False)))
+        if hasattr(self.sig, "locate_boxes"):   # 상자 위치를 사진으로 확인 (팔을 트레이 위로 비켜서)
+            vx, vy = self.cfg["vision"]["box"]["view_xy_m"]
+            self.r.transit_to(vx, vy, self.cfg["motion"]["transit_speed_pct"])
+            try:
+                res, info = self.sig.locate_boxes()
+            except ValueError as e:
+                raise RobotError(f"상자 위치 확인 실패: {e}")
+            for g, (x, y) in res.items():
+                if g in self.cfg["boxes"]:
+                    self.cfg["boxes"][g]["xy_m"] = [x, y]
+            log.info("상자 위치 확인 (%s): %s", info,
+                     ", ".join(f"{g} ({x:.3f}, {y:.3f})" for g, (x, y) in res.items()))
+            self.dash.mission("box", info=info, **{g: [round(x, 3), round(y, 3)] for g, (x, y) in res.items()})
         self.r.go_home()
         clear = getattr(self.sig, "needs_clear_view", False)   # 카메라: 찍기 전에 팔을 시야 밖(홈)으로
         for i in range(n):
@@ -266,7 +287,7 @@ class Mission:
                     log.warning("재시도 %d/%d", attempt, retries)
                 try:
                     ok = self.pick(*xy)
-                except (RobotFault, MotionTimeout):
+                except (RobotFault, MotionTimeout, ForceStop):
                     raise
                 except RobotError as e:   # 관절 해 없음·작업영역 밖 → 이 사과만 건너뛴다
                     log.error("사과 %d 건너뜀: %s", i + 1, e)
@@ -343,7 +364,7 @@ def dry_run(robot, cfg, speed_pct):
     T = "transit"
     steps = [("홈 (상자 쪽 높은 곳)", "home", None)]
     G = "grip"
-    for g in ("상", "중"):    # 칸마다 한 번씩 집는 척 → 놓는 척
+    for g in grade_labels(cfg):    # 칸마다 한 번씩 집는 척 → 놓는 척
         b = cfg["boxes"][g]
         bx, by = b["xy_m"]
         steps += [("트레이 가운데 위 (이동 높이, 약간 기울어짐)", T, (tx, ty)),
@@ -477,6 +498,9 @@ def main():
             raise
         except RobotFault as e:
             dash.mission("estop", reason=f"로봇 고장: {e}")
+            raise
+        except ForceStop as e:
+            dash.mission("estop", reason=f"힘 이상 자동 정지: {e}")
             raise
         except (RobotError, IOError) as e:
             dash.mission("estop", reason=f"정지: {e}")

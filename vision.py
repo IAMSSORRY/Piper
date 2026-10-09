@@ -260,8 +260,9 @@ def detect_apples(bgr, cfg, roi=None):
 
 def grade_of(red_ratio, dark_ratio, v):
     g = v["grade"]
+    hi, lo = g.get("labels", ["상", "중"])
     top = red_ratio >= g["red_ratio_min"] and dark_ratio <= g["dark_ratio_max"]
-    return "상" if top else "중"
+    return hi if top else lo
 
 
 def draw(bgr, apples, cfg, calib=None, extra=None):
@@ -270,10 +271,10 @@ def draw(bgr, apples, cfg, calib=None, extra=None):
     cv2.rectangle(out, (x, y), (x + w, y + h), (200, 200, 200), 1)
     cv2.polylines(out, [np.array(cfg["vision"]["tray_roi_px"], np.int32)], True, (255, 255, 0), 1)
     for i, a in enumerate(apples):
-        col = (0, 0, 255) if a.grade == "상" else (0, 200, 255)
+        col = (0, 0, 255) if a.grade == "상" else (0, 200, 255)   # 빨강 = 높은 등급, 노랑 = 낮은 등급
         cv2.circle(out, (int(a.u), int(a.v)), int(a.r), col, 2)
         cv2.drawMarker(out, (int(a.u), int(a.v)), col, cv2.MARKER_CROSS, 12, 2)
-        t = f"{i} {'A' if a.grade == '상' else 'B'} r{a.red_ratio:.2f} d{a.dark_ratio:.2f}"
+        t = f"{i} {'A' if a.grade == '상' else ('C' if a.grade == '하' else 'B')} r{a.red_ratio:.2f} d{a.dark_ratio:.2f}"
         if a.x is not None:
             t2 = f"({a.x:.3f},{a.y:.3f}) D{a.d_m * 1000:.0f}mm"
             cv2.putText(out, t2, (int(a.u - a.r), int(a.v + a.r + 30)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
@@ -286,7 +287,7 @@ def draw(bgr, apples, cfg, calib=None, extra=None):
         else:
             continue
         cv2.drawMarker(out, (int(u), int(v)), (255, 0, 255), cv2.MARKER_TILTED_CROSS, 20, 2)
-        cv2.putText(out, "ZONE A" if name == "상" else "ZONE B", (int(u) + 8, int(v)),
+        cv2.putText(out, "ZONE " + {"상": "A(top)", "중": "B(mid)", "하": "C(low)"}.get(name, name), (int(u) + 8, int(v)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
         if calib is not None:   # 굴림 판정 구역
             r_px = cfg["vision"]["box_radius_m"] / calib.m_per_px(u, v)
@@ -501,6 +502,60 @@ def open_roll_watcher(cfg):
         return None
 
 
+# ---------- 상자 위치 (사진으로) ----------
+
+def find_box(bgr, cfg):
+    """골판지 상자 바깥 사각형 4꼭짓점 (위왼·위오·아래오·아래왼, 픽셀). 못 찾으면 None."""
+    b = cfg["vision"]["box"]
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    h, s, v = cv2.split(hsv)
+    lo, hi = b["hue"]
+    m = ((h >= lo) & (h <= hi) & (s >= b["sat_min"]) & (v >= b["val_min"])).astype(np.uint8) * 255
+    m &= _roi_mask(bgr.shape, b["search_roi_px"])
+    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7)))
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (31, 31)))
+    cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return None
+    c = max(cnts, key=cv2.contourArea)
+    if cv2.contourArea(c) < b["min_area_px"]:
+        return None
+    pts = cv2.boxPoints(cv2.minAreaRect(c))
+    # 위왼·위오·아래오·아래왼 순서로
+    sm, df = pts.sum(1), np.diff(pts, axis=1).ravel()
+    return np.array([pts[np.argmin(sm)], pts[np.argmin(df)], pts[np.argmax(sm)], pts[np.argmax(df)]], np.float32)
+
+
+def locate_boxes(bgr, cfg, calib):
+    """사진에서 상자를 찾아 기준 사진 대비 이동·회전을 구하고, 칸 중심(로봇 좌표)을 돌려준다.
+    반환 ({등급: (x, y)}, 정보 문자열, 그린 이미지). 못 찾거나 너무 많이 움직였으면 ValueError."""
+    b = cfg["vision"]["box"]
+    cur = find_box(bgr, cfg)
+    if cur is None:
+        raise ValueError("사진에서 상자를 못 찾았습니다 (팔이 가렸거나 상자가 화면 밖)")
+    ref = np.array(b["ref_corners_px"], np.float32)
+    M, _ = cv2.estimateAffinePartial2D(ref, cur)
+    if M is None:
+        raise ValueError("상자 위치 계산 실패")
+    ang = math.degrees(math.atan2(M[1, 0], M[0, 0]))
+    scale = math.hypot(M[0, 0], M[1, 0])
+    out = bgr.copy()
+    cv2.polylines(out, [cur.astype(int)], True, (0, 0, 255), 2)
+    res, shift_m = {}, 0.0
+    for g, (u, v) in b["compartments_px"].items():
+        cu, cv_ = M @ np.array([u, v, 1.0])
+        x, y = calib.px2xy(cu, cv_)
+        x0, y0 = calib.px2xy(u, v)
+        shift_m = max(shift_m, math.hypot(x - x0, y - y0))
+        res[g] = (float(x), float(y))
+        cv2.drawMarker(out, (int(cu), int(cv_)), (255, 0, 255), cv2.MARKER_TILTED_CROSS, 22, 2)
+        cv2.putText(out, f"{g} ({x:.3f},{y:.3f})", (int(cu) - 60, int(cv_) - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 2)
+    info = f"이동 {shift_m * 1000:.0f}mm, 회전 {ang:.1f}°, 크기비 {scale:.3f}"
+    if shift_m > b["max_shift_m"] or abs(ang) > b["max_rot_deg"] or abs(scale - 1) > 0.15:
+        raise ValueError(f"상자가 기준에서 너무 많이 바뀌었습니다 ({info}) — 상자 위치 확인 또는 기준 사진 다시")
+    return res, info, out
+
+
 # ---------- 미션 연동 신호 ----------
 
 class CameraSignals:
@@ -562,6 +617,13 @@ class CameraSignals:
 
     def grade(self):
         return self.cur.grade if self.cur else None
+
+    def locate_boxes(self):
+        """상자 칸 중심을 사진으로 다시 잡는다 (미션 시작 때, 팔이 상자를 안 가릴 때 부른다)."""
+        img = self.cam.latest(after=time.monotonic() + self.v["settle_s"])
+        res, info, out = locate_boxes(img, self.cfg, self.calib)
+        self._save("box", out)
+        return res, info
 
     def mark_bad(self):
         if self.cur is not None:

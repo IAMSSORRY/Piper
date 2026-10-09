@@ -66,6 +66,11 @@ class RobotFault(RobotError):
     pass
 
 
+class ForceStop(RobotError):
+    """관절 부하가 갑자기 튐 (어딘가에 닿았다) → 그 자리 정지."""
+    pass
+
+
 def _fix_cmd(port):
     return (f"sudo ip link set {port} down; "
             f"sudo ip link set {port} type can bitrate 1000000; "
@@ -132,6 +137,16 @@ class Robot:
         self.arm = None
         self._estopped = threading.Event()
         self.jaw_yaw = None   # 집게가 닫히는 방향(로봇 xy 평면 각도, rad). None = 기본 자세 그대로
+        fm = cfg.get("force_monitor", {})
+        self.fm_on = bool(fm.get("enabled", False)) and not sim
+        self.fm_thr = [float(v) for v in fm.get("threshold_nm", [2.0] * 6)]
+        self.fm_tau = float(fm.get("baseline_s", 0.5))
+        self.fm_hold = float(fm.get("persist_s", 0.1))
+        self.fm_base = None
+        self.fm_t = None
+        self.fm_over_since = None
+        self.fm_peak = [0.0] * 6     # 이번 동작 최대 편차 (로그용, 기준값 정하기)
+        self.fm_log = []             # (동작, 관절별 최대 편차) — 기준값 정할 때 본다
 
     # ---------- 연결 ----------
     def connect(self, enable=True):
@@ -253,6 +268,39 @@ class Robot:
         if code not in NON_FAULT_STATUS:
             raise RobotFault(f"로봇 상태 이상 0x{code:02X}: {ARM_STATUS_TEXT.get(code, '알 수 없음')}\n{st.err_status}")
 
+    def _efforts(self):
+        h = self.arm.GetArmHighSpdInfoMsgs()
+        return [getattr(h, f"motor_{i}").effort / 1000.0 for i in range(1, 7)]
+
+    def _fm_reset(self):
+        self.fm_base, self.fm_t, self.fm_over_since = None, None, None
+        self.fm_peak = [0.0] * 6
+
+    def _check_force(self):
+        """관절 부하(N·m)가 최근 평균(baseline_s)에서 threshold 넘게 persist_s 이상 벗어나면 ForceStop."""
+        if not self.fm_on:
+            return
+        e = self._efforts()
+        now = time.monotonic()
+        if self.fm_base is None:
+            self.fm_base, self.fm_t = list(e), now
+            return
+        dt = now - self.fm_t
+        self.fm_t = now
+        a = min(1.0, dt / self.fm_tau)
+        dev = [abs(v - b) for v, b in zip(e, self.fm_base)]
+        self.fm_peak = [max(p, d) for p, d in zip(self.fm_peak, dev)]
+        over = [i for i in range(6) if dev[i] > self.fm_thr[i]]
+        if over:
+            self.fm_over_since = self.fm_over_since or now
+            if now - self.fm_over_since >= self.fm_hold:
+                j = over[0]
+                raise ForceStop(f"관절{j + 1} 부하 이상: {e[j]:+.2f} N·m (평소 {self.fm_base[j]:+.2f}, 기준 ±{self.fm_thr[j]:.1f}) "
+                                f"— 어딘가에 닿은 것 같습니다")
+        else:
+            self.fm_over_since = None
+            self.fm_base = [b + a * (v - b) for v, b in zip(e, self.fm_base)]   # 정상일 때만 평균 갱신
+
     def current_pose(self):
         e = self.arm.GetArmEndPoseMsgs().end_pose
         return (sdk2m(e.X_axis), sdk2m(e.Y_axis), sdk2m(e.Z_axis),
@@ -282,9 +330,21 @@ class Robot:
         last_prog, last_prog_t = None, t0
         near_since = None
         resend_until = t0 + SEND_BURST_S
+        self._fm_reset()
+        try:
+            return self._run_loop(send, done, timeout, what, near, progress, t0, last_send, last_prog, last_prog_t,
+                                  near_since, resend_until)
+        finally:
+            if self.fm_on:
+                log.debug("%s 부하 최대 편차 %s", what, " ".join(f"{v:.2f}" for v in self.fm_peak))
+                self.fm_log.append((what, list(self.fm_peak)))
+
+    def _run_loop(self, send, done, timeout, what, near, progress, t0, last_send, last_prog, last_prog_t,
+                  near_since, resend_until):
         while True:
             now = time.monotonic()
             self._check_fault(unreach=now - t0 >= 0.3)
+            self._check_force()
             if now < resend_until and now - last_send >= RESEND_PERIOD_S:
                 send()
                 last_send = now
@@ -393,8 +453,10 @@ class Robot:
         t0 = time.monotonic()
         last_send = -1.0
         last_w, still_since = None, None
+        self._fm_reset()
         while True:
             self._check_fault()
+            self._check_force()
             now = time.monotonic()
             if now - last_send >= RESEND_PERIOD_S:
                 self.arm.GripperCtrl(abs(m2sdk(width)), effort, 0x01, 0)
