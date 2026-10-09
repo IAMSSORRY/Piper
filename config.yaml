@@ -1,0 +1,190 @@
+# 사과 픽앤플레이스 설정 — 현장에서는 이 파일만 고친다.
+#
+# 단위: 거리 m, 각도 rad, 속도 % (PIPER 펌웨어 속도 비율 1~100)
+# 좌표계: 로봇 베이스 기준 (x 앞, y 왼쪽, z 위)
+# 실제 좌표는 팔을 손으로 옮겨 놓고 `python3 mission.py --read-pose` 로 읽어서 넣는다.
+# ★ 표시는 실기에서 반드시 확인할 값.
+
+can_port: can_arm1
+
+# 카메라 — 같은 모델·같은 시리얼이라 번호(/dev/videoN) 대신 꽂은 USB 포트 경로로 구분한다.
+# ★ 포트를 바꿔 꽂으면 이 경로가 바뀐다 (확인: ls -l /dev/v4l/by-path/)
+cameras:
+  top: /dev/v4l/by-path/pci-0000:00:14.0-usb-0:1:1.0-video-index0     # 노트북 본체 포트
+  wrist: /dev/v4l/by-path/pci-0000:00:14.0-usb-0:4.2:1.0-video-index0 # 허브 경유
+  width: 1280
+  height: 720
+
+# 그리퍼가 바닥을 보는 공구 자세 [RX, RY, RZ]. piper_sdk 공식 demo/V2/piper_ctrl_moveL.py 값 (-179.9°, 0, -179.9°)
+# 참고: RY≈85° 는 그리퍼가 앞(수평)을 보는 자세다. ★ --verify 때 그리퍼가 수직인지 눈으로 확인
+tool_orientation_rad: [-3.1398, 0.0, -3.1398]
+
+# 대기 자세 = 그리퍼가 아래를 본 채 상자 쪽 높은 곳 (트레이를 가리지 않는다). 18:37 수정
+# ⚠ 관절 전부 0(접힌 자세)은 긴 그리퍼가 몸체를 친다 — 쓰지 않는다
+home_xy_m: [0.25, 0.15]          # 이동 높이(transit_tip_z_m)에서 이 위치 ★
+home_joints_rad: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]   # 참고용 (접힌 자세). go_home 에서 안 쓴다
+
+# 이 높이 이상에서만 수평 이동한다 (상자 벽·사과보다 높게) ★
+z_safe_m: 0.232            # 수직 상승 높이 (플랜지) = 손가락끝 0.10. 그리퍼 수직으로는 여기가 거의 최대 (joint5 한계)
+
+# 높은 이동 (벽 넘기) — 관절 각도 직접 계산 (ik.py). 실측: 수직으로 높이 올리면 joint5 가 한계(70°)를 넘는다
+tool_length_m: 0.132       # 플랜지 → 손가락끝 (트레이 바닥 실측: 플랜지 z 0.132 일 때 손가락끝이 바닥)
+transit_tip_z_m: 0.19      # 이동 높이 = 손가락끝 z. 사과 아랫면 0.158 > 종이 상자 벽 0.14 (18:30 실측) ★
+j5_max_rad: 1.20           # joint5 사용 한계 (SDK 한계 1.22 에서 여유)
+j5_firmware_max_rad: 1.10  # 펌웨어 수직 직선(MOVE L)에 맡기는 joint5 상한 (실측 19:14: 한계 근처에서 펌웨어가 거부)
+transit_min_r_m: 0.16      # 베이스에서 이보다 가까운 목표는 이 반경에서 멈추고 비스듬히 내려간다
+
+# 이 범위 밖 좌표는 보내기 전에 거부한다
+workspace:
+  x: [0.05, 0.55]           # 트레이 윗줄이 x≈0.07~0.10 (실측)
+  y: [-0.45, 0.45]
+  z: [-0.02, 0.50]
+  max_reach_m: 0.60
+  min_reach_m: 0.09         # 베이스 수평 반경 하한. 0.10 에서도 파지 수직 가능 (19:34 계산)
+  max_reach_xy_m: 0.56      # 수평 거리 상한. 0.545 에서도 파지 기울기 12° (19:31 계산). 진짜 기준은 관절 해가 있느냐 — 없으면 그 사과만 건너뜀
+
+motion:
+  transit_speed_pct: 40      # 빈 공중 이동
+  move_timeout_s: 15.0       # 동작 하나당 최대 시간. 넘으면 그 자리 정지 후 종료
+  pos_tol_m: 0.004           # 도착 판정 거리 오차
+  joint_tol_rad: 0.02        # 도착 판정 관절 오차
+
+gripper:
+  open_width_m: 0.100        # 사과보다 넉넉히. 하드웨어 최대보다 크면 최대에서 멈춘다 (멈춤 감지로 완료 처리) ★
+  auto_jaw: true             # 벽·이웃 사과를 피해 집게 방향(손목 회전)을 고른다
+  open_margin_m: 0.02        # 카메라 모드: 사과 지름 + 이만큼만 연다 (벽 옆 여유)
+  jaw_axis_tool: y           # 기본 자세에서 집게가 닫히는 방향이 공구 y축(y) 인지 x축(x) 인지 — --jaw-test 로 확인 ★
+  finger_width_m: 0.015      # 손가락 두께 (여유 계산용) ★
+  close_width_m: 0.0         # 닫기 목표 (사과에 막혀서 멈추는 걸 파지로 판단)
+  effort_nm: 0.5            # 쥐는 힘 0~5 N·m. 19:30 "너무 세다" → 1.0→0.5. 미끄러지면 0.7, 아직 세면 0.3 ★
+  min_grasp_width_m: 0.020   # 닫은 뒤 이보다 좁으면 "못 집음"
+  timeout_s: 4.0
+
+# 트레이 (사과 놓인 곳)
+pick:
+  tray_z_m: 0.132            # 손가락 끝이 트레이 바닥에 닿을 때 플랜지 z (17:55 실측). 아래 높이들은 전부 여기 기준
+  grasp_height_m: 0.030      # 바닥 위 손가락 끝 높이 ≈ 사과 반지름 (사과 지름 ~64mm) ★
+  approach_height_m: 0.10    # 바닥 위 접근 높이 (사과 높이 64mm + 여유). 여기까지 빠르게, 그다음 천천히
+  descend_speed_pct: 20      # 하강 속도 (적응형 조정 대상)
+  lift_speed_pct: 25         # 쥐고 올라가는 속도
+  retries: 1                 # 못 집었을 때 재시도 횟수
+  grasp_offset_m: [-0.010, 0.0]  # 잡는 위치 미세 보정 [x, y] m. +x = Sony 화면 아래, +y = 화면 오른쪽. 19:32 "화면상 살짝 위로" → -1cm ★
+
+# 카메라가 찍는 고정 검사 위치
+inspect:
+  xy_m: [0.25, 0.0]         # 이동 높이에서 이 위치 (카메라가 찍는 곳) ★
+  wait_s: 1.5                # 카메라 촬영 대기
+  default_grade: 중          # 등급 신호가 안 오면 이 등급으로
+
+# 등급별 놓는 곳. 상자가 하나뿐이라 한 상자 안을 두 구역으로 나눈다.
+#   px: 카메라 화면 좌표 [u, v] — 캘리브레이션(calib.yaml) 후 로봇 좌표로 자동 변환된다 ★
+#   xy_m: 로봇 좌표를 직접 줄 때 (있으면 px 보다 우선). calib 없을 때(SIM)도 이 값을 쓴다
+#   floor_z_m: 상자 바닥 높이 ★
+#   화면에서 로봇은 위쪽에 있다 → 위쪽 구역이 가깝다. 두 구역 중심은 20cm 이상 떨어뜨린다
+boxes:
+  상: {xy_m: [0.136, 0.163], xy_m_sim: [0.15, 0.30], floor_z_m: 0.136}   # 종이 상자 상 칸 바닥 가운데 (18:20 실측)
+  중: {xy_m: [0.286, 0.175], xy_m_sim: [0.15, -0.30], floor_z_m: 0.134}   # 종이 상자 중 칸 바닥 가운데 (18:28 실측)
+
+place:
+  descend_speed_pct: 20      # 상자 안으로 내려가는 속도 (적응형 조정 대상)
+  release_height_m: 0.04     # 상자 바닥 위 놓는 높이 (적응형 조정 대상). 사과 아래면이 바닥에 닿을 정도가 이상적
+  release_settle_s: 1.0      # 그리퍼 연 뒤 정지 대기 (사과 안정 + 손목 카메라 굴림 관찰)
+  lift_speed_pct: 30
+
+# 굴림 신호 → 하강 속도·놓는 높이 20% 하향
+adaptive:
+  enabled: true
+  down_ratio: 0.20
+  up_ratio: 0.05             # 연속 성공 시 복구 비율 (기준값 이상으로는 안 올라감)
+  success_streak_for_up: 2
+  max_consecutive_down: 3    # 연속 감속 이 횟수에 도달하면 자동 조정 중단
+  min_speed_pct: 8           # 속도 하한
+  min_release_height_m: 0.032  # 사과 반지름 — 이보다 낮으면 손가락이 바닥에 닿는다
+
+mission:
+  apple_count: 5
+
+# SIM=true 일 때만 쓰는 값
+sim:
+  speedup: 5.0               # 시뮬 동작·대기 배속
+  tool_length_m: 0.132       # 시뮬 순기구학용 (위 tool_length_m 과 같게)
+  seed: 42
+  roll_prob: 0.3             # 놓은 뒤 굴림 발생 확률
+  miss_prob: 0.1             # 파지 실패 확률
+  apple_width_m: 0.075
+  stall: false               # true 면 로봇이 안 움직임 → 타임아웃 경로 테스트
+  start_pose_m: [0.056, 0.0, 0.213]
+  apples_xy_m:               # 시뮬 / 수동 모드 기본 사과 위치
+    - [0.28, 0.05]
+    - [0.32, -0.04]
+    - [0.26, -0.08]
+    - [0.35, 0.08]
+    - [0.30, 0.0]
+
+# 카메라 검출 (vision.py) — 위에서 내려다보는 Sony 카메라. 화면 확인: python3 vision.py
+vision:
+  stream_url: http://localhost/api/cameras/dev_video2/stream   # PIPER Studio camerad 스트림
+  device: /dev/v4l/by-path/pci-0000:00:14.0-usb-0:1:1.0-video-index0  # 스트림 안 될 때 직접 열기
+  calib_file: calib.yaml     # calibrate.py 가 만든다
+  color_file: color.yaml     # vision.py --graycard 가 만든다 (없으면 색 보정 안 함)
+  # 회색 카드 영역 [x, y, w, h] 픽셀 — 카드 가장자리 안쪽으로 ★
+  gray_card_roi_px: [460, 330, 75, 75]
+  settle_s: 0.3              # 팔을 뺀 뒤 이만큼 지난 프레임으로 검출
+  # 트레이 영역 (픽셀 다각형). 카메라·트레이를 옮기면 다시 잡는다 ★
+  tray_roi_px: [[100, 88], [618, 95], [612, 540], [100, 525]]
+  min_radius_px: 32          # 사과 반지름 ~45px. 가려져 잘린 조각(작은 원)은 버린다
+  max_radius_px: 60         # 사과 실측 반지름 ~45px. 크게 잡으면 붙은 사과 덩어리를 하나로 본다
+  sat_min: 90                # 색 판정 채도 하한 (트레이 청록·바닥 흰색 제외)
+  val_min: 60
+  red_hue: [12, 165]         # 빨강: H <= 12 또는 H >= 165 (OpenCV H 0~180)
+  yellow_hue: [12, 38]       # 노랑: 12 < H <= 38
+  dark_val_max: 50           # 이보다 어두우면 흠/멍
+  grade:                     # 상 = 빨강 비율 이상 AND 흠 비율 이하. 나머지 = 중 ★
+    red_ratio_min: 0.5
+    dark_ratio_max: 0.10     # 꼭지·그림자 여유
+  box_radius_m: 0.08         # 구역 중심에서 이 반경 안에서 놓은 사과를 찾는다 (두 구역이 안 겹치게)
+  roll:
+    window_s: 1.0            # 놓은 뒤 관찰 시간
+    match_m: 0.03            # 놓기 전부터 있던 사과로 볼 거리
+    max_offset_m: 0.05       # 놓은 지점에서 이만큼 넘게 떨어져 있으면 굴림
+    max_motion_m: 0.015      # 관찰 중 이만큼 넘게 움직이면 굴림
+
+# 카메라-로봇 캘리브레이션 (calibrate.py)
+# 로봇이 사과 하나를 쥐고 트레이 위 격자점에 내려놓으면 카메라가 찾아서 픽셀↔로봇 좌표 대응을 만든다.
+calibration:
+  # 격자 범위 = 트레이 안쪽 두 모서리 (로봇 좌표 m). ★ --read-pose 로 그리퍼를 트레이 모서리 안쪽에 대고 읽은 값
+  corner1_xy_m: [0.068, -0.333]   # 트레이 왼쪽 위 (화면 기준). 17:50 티칭으로 실측
+  corner2_xy_m: [0.353, -0.038]  # 트레이 오른쪽 아래 (화면 기준). 17:52 티칭으로 실측
+  grid: [3, 3]               # 격자 점 개수 (최소 4점, 9점 권장)
+  margin_m: 0.05             # 모서리에서 안쪽으로 이만큼 들여서 격자
+  max_residual_m: 0.008      # 이보다 오차 큰 점은 버리고 다시 계산
+
+# 굴림 판정 카메라. mode: wrist = 손목 카메라 (놓기 직전 쥔 사과 → 그리퍼 연 뒤 정지 상태에서 움직임 관찰)
+#                   mode: box   = 상자 안을 보는 고정 카메라 (6번, 지금 빠져 있음)
+roll_camera:
+  enabled: true
+  mode: wrist
+  device: /dev/v4l/by-path/pci-0000:00:14.0-usb-0:4.2:1.0-video-index0   # Global Shutter 손목 카메라 ★
+  width: 640
+  height: 480
+  fourcc: MJPG
+  roi_px: null               # 그리퍼 손가락이 가리는 부분을 빼려면 다각형
+  sat_min: 165               # 골판지 S ≤ ~150, 사과 S 190~255 (실측) — 골판지를 사과로 안 보게
+  val_min: 50
+  red_hue: [12, 165]
+  yellow_hue: [12, 38]
+  min_area_px: 800           # 이보다 작은 색 덩어리는 무시
+  match_px: 30               # 놓기 전부터 있던 사과로 볼 거리
+  move_px: 60                # 놓은 뒤 이만큼 넘게 움직이면 굴림 (640x480, 사과 바로 위) ★ 굴려보고 조정
+  window_s: 1.0              # box 모드 관찰 시간 (wrist 모드는 place.release_settle_s 동안)
+
+# SSORRY 대시보드 서버 (IAMSSORRY/Server). 판정마다 /ingest/judge, 놓기마다 /ingest/motion
+#   v_value/threshold = 빨강 비율 / 임계값 (판정 근거), confidence = 임계값에서 떨어진 정도
+#   approach_speed = 하강 속도 배율, place_height = 놓는 높이(m)
+# 토큰: 서버 INGEST_TOKEN 과 같은 값을 환경변수로 → export SSORRY_TOKEN=...
+dashboard:
+  enabled: true              # SIM 에서는 꺼진다 (--dashboard on 으로 강제)
+  url: http://localhost:8000
+  cam: top                   # bbox 기준 카메라 = PIPER 라벨 top (Sony)
+  token_env: SSORRY_TOKEN
+  timeout_s: 2.0
