@@ -556,8 +556,12 @@ def bruise_score(bgr, cfg):
     if st[k, cv2.CC_STAT_AREA] < b["min_apple_px"]:
         return None, int(st[k, cv2.CC_STAT_AREA]), img
     apple = (lab == k).astype(np.uint8)
-    # 구멍(아주 어두운 곳)은 채우지 않는다: 채우면 꽃받침(밑동의 둥근 검은 오목)까지 멍으로 센다 (21:40 실측).
-    # 진한 멍은 가장자리의 덜 어두운 부분으로 잡힌다 (멍 사과 6.0% vs 멀쩡한 사과 0.2% 이하)
+    # 아주 어두운 멍(V<60)은 색 마스크에서 빠져 구멍이 된다 → 사과 안에 갇힌 구멍은 채운다.
+    # (볼록 껍질로 채우면 사과 위를 지나는 검은 손가락까지 멍으로 센다)
+    # 21:35 실측 사진: 멍 사과 2개 7.7% / 4.9%, 멀쩡한 3개 0.2 / 0.2 / 0.5% (기준 2%)
+    cnts, _ = cv2.findContours(apple, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    apple = np.zeros_like(apple)
+    cv2.drawContours(apple, cnts, -1, 1, cv2.FILLED)
     # 가장자리(손가락 그림자·반사)는 빼고 안쪽만 본다: 가장자리에서 반지름의 edge_frac 이상 들어간 곳
     dist = cv2.distanceTransform(apple, cv2.DIST_L2, 5)
     apple = dist >= dist.max() * b.get("edge_frac", 0.25)
