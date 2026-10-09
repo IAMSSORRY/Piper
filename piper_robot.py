@@ -70,6 +70,11 @@ class _Contact(Exception):
     """guarded_down 안에서만 쓰는 신호: 닿았다."""
 
 
+class SoftStop(RobotError):
+    """원격 비상정지 요청 — 하던 동작을 그 자리에서 멈춘다 (그 뒤 안전 자세로 옮기고 실제 비상정지)."""
+    pass
+
+
 class ForceStop(RobotError):
     """관절 부하가 갑자기 튐 (어딘가에 닿았다) → 그 자리 정지."""
     pass
@@ -140,6 +145,7 @@ class Robot:
         self.time_scale = float(cfg["sim"]["speedup"]) if sim else 1.0
         self.arm = None
         self._estopped = threading.Event()
+        self._soft_stop = threading.Event()
         self.jaw_yaw = None   # 집게가 닫히는 방향(로봇 xy 평면 각도, rad). None = 기본 자세 그대로
         fm = cfg.get("force_monitor", {})
         self.fm_on = bool(fm.get("enabled", False)) and not sim
@@ -263,9 +269,19 @@ class Robot:
     def _status(self):
         return self.arm.GetArmStatus().arm_status
 
+    def soft_stop(self):
+        self._soft_stop.set()
+
+    def clear_soft_stop(self):
+        self._soft_stop.clear()
+
     def _check_fault(self, unreach=True):
         if self._estopped.is_set():
             raise RobotFault("비상정지됨")
+        if self._soft_stop.is_set():
+            self._soft_stop.clear()
+            self.hold()
+            raise SoftStop("원격 비상정지 요청 — 그 자리 정지")
         st = self._status()
         code = int(st.arm_status)
         if code in UNREACHABLE_STATUS and not unreach:

@@ -8,7 +8,8 @@
   POST /resume                  비상정지(또는 오류 정지) 해제 → 멈춘 사과부터 이어서
   POST /stop                    지금 사과까지만 하고 멈춤
 
-state: idle(대기) / running(실행 중) / estopped(비상정지) / error(오류로 그 자리 정지) / done(완료)
+state: idle(대기) / running(실행 중) / stopping(비상정지 처리 중) / estopped(비상정지) / error(오류로 그 자리 정지) / done(완료)
+비상정지: 그 자리 정지 → 사과를 쥐고 있으면 집은 자리에 되돌려 놓기 → 팔을 낮게 내리기 → 실제 비상정지(모터 정지)
 토큰: Authorization: Bearer <SSORRY_TOKEN> (대시보드 ingest 토큰과 같은 값). 토큰이 없으면 검사 안 함.
 """
 import json
@@ -17,7 +18,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from piper_robot import ForceStop, RobotError, RobotFault
+from piper_robot import ForceStop, RobotError, RobotFault, SoftStop
 
 log = logging.getLogger("control")
 
@@ -49,6 +50,8 @@ class Controller:
         try:
             self.mission.run(resume=resume)
             self._set("done")
+        except SoftStop:                 # 원격 비상정지 — estop() 이 이어서 안전 동작 후 실제 비상정지
+            self._set("stopping", "원격 비상정지")
         except RobotFault as e:          # 비상정지 버튼·PIPER Studio 비상정지·로봇 고장
             if not self.r._estopped.is_set():
                 self.r.estop()
@@ -80,10 +83,27 @@ class Controller:
             return True, "시작"
 
     def estop(self):
-        self.r.estop()                   # 실행 중이면 동작 루프가 RobotFault 로 빠져나와 estopped 가 된다
-        if self.state != "running":
-            self._set("estopped", "원격 비상정지")
-        return True, "비상정지 전송"
+        """원격 비상정지: 하던 동작을 그 자리에서 멈춤 → (사과를 쥐고 있으면 집은 자리에 되돌려 놓고) 팔을 낮게
+        내림 → 실제 비상정지(모터 정지). 안전 동작이 실패하면 바로 실제 비상정지."""
+        with self._lock:
+            if self.r._estopped.is_set():
+                return True, "이미 비상정지 상태"
+            if self.state == "running":
+                self.r.soft_stop()
+                if self._th is not None:
+                    self._th.join(timeout=8)
+            self.r.clear_soft_stop()
+            note = "원격 비상정지"
+            try:
+                if self.mission is not None and self.cfg.get("estop", {}).get("safe_park", True):
+                    self.mission.safe_park()
+                    note += " (사과 되돌림·팔 내림 후)"
+            except Exception as e:
+                log.error("비상정지 안전 동작 실패 → 바로 비상정지: %s", e)
+                note += f" (안전 동작 실패: {e})"
+            self.r.estop()
+            self._set("estopped", note)
+            return True, note
 
     def resume(self):
         with self._lock:

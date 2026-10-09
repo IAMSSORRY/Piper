@@ -201,6 +201,7 @@ class Mission:
         self.dash = dash or Dashboard({})
         self.placed = {}      # 칸별 놓은 개수
         self.results, self.next_i, self.stop_requested, self.t0 = [], 0, False, time.monotonic()
+        self.last_pick = None
         self.last_drop = None  # 운반 중 낙하 표시
         self.roll = roll      # 굴림 카메라 (vision.BoxRollWatcher). 없으면 signals.rolled()
 
@@ -244,6 +245,7 @@ class Mission:
         if ok and self.r.gripper_width() < min_w:
             log.warning("상승 중 사과를 놓쳤습니다")
             ok = False
+        self.last_pick = (x, y, self.r.jaw_yaw) if ok else None   # 비상정지 때 이 자리에 되돌려 놓는다
         log.info("파지 %s (폭 %.1fmm)", "성공" if ok else "실패", w * 1000)
         self.dash.mission("pick", ok=bool(ok), attempt=getattr(self, "_attempt", 0), width_mm=round(w * 1000, 1))
         return ok
@@ -377,6 +379,34 @@ class Mission:
             self.roll.stop()                 # 팔이 올라가기 전에 관찰 끝
         self.r.down_to(bx, by, z_lift, p["lift_speed_pct"])
 
+    def safe_park(self):
+        """비상정지 직전 안전 동작: 사과를 쥐고 있으면 집었던 자리에 되돌려 놓고, 팔을 낮은 쉬는 자세로 내린다."""
+        p, c = self.cfg["pick"], self.cfg
+        spd = c.get("estop", {}).get("speed_pct", 30)
+        if self.r.gripper_width() >= c["gripper"]["min_grasp_width_m"]:
+            if self.last_pick:
+                x, y, jaw = self.last_pick
+            else:
+                (x1, y1), (x2, y2) = c["calibration"]["corner1_xy_m"], c["calibration"]["corner2_xy_m"]
+                x, y, jaw = (x1 + x2) / 2, (y1 + y2) / 2, None
+            log.warning("비상정지: 쥐고 있던 사과를 원래 자리 (%.3f, %.3f) 에 되돌려 놓는다", x, y)
+            self.dash.mission("phase", phase="estop_return")
+            self.r.transit_to(x, y, spd)
+            self.r.jaw_yaw = jaw
+            how, z = self.r.guarded_down(x, y, p["tray_z_m"] + p["grasp_height_m"] + 0.005,
+                                         p["descend_speed_pct"], c["place"].get("contact_nm", 0.5))
+            self.r.grip(True, width=self.r.gripper_width() + 0.012)
+            self.r.down_to(x, y, max(self.r.lift_z(x, y), z + 0.05), spd)
+            self.r.jaw_yaw = None
+            self.last_pick = None
+        # 팔 내리기: 쉬는 자세 (낮게 — 모터 전원이 빠져도 덜 떨어진다)
+        rx, ry = c.get("estop", {}).get("rest_xy_m", c["home_xy_m"])
+        rz = c.get("estop", {}).get("rest_tip_z_m", 0.17)
+        log.info("비상정지: 팔을 쉬는 자세 (%.3f, %.3f) 손가락끝 %.2fm 로 내린다", rx, ry, rz)
+        self.dash.mission("phase", phase="estop_rest")
+        self.r.transit_to(rx, ry, spd)
+        self.r.down_to(rx, ry, rz + self.r.tool_len, spd)
+
     def recover_held(self):
         """이어하기 전: 사과를 쥔 채 멈췄으면 트레이 가운데에 살살 내려놓는다 (다시 찍어서 처음부터 집는다)."""
         if self.r.gripper_width() < self.cfg["gripper"]["min_grasp_width_m"]:
@@ -478,6 +508,8 @@ class Mission:
             grade = self.inspect()
             self.dash.judge(grade, getattr(self.sig, "judge_info", lambda: None)())
             self.place(grade)
+            self.last_pick = None
+            self.next_i = i + 1                  # 놓았으면 이 사과는 끝 (뒤에서 멈춰도 다시 하지 않는다)
             self.r.jaw_yaw = None
             rolled = self.roll.verdict() if self.roll else self.sig.rolled(grade)
             drop_m = getattr(self.roll, "last_drop_m", None) if self.roll else None

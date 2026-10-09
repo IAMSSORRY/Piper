@@ -276,3 +276,10 @@ nudge:
 control:
   host: 0.0.0.0
   port: 8765
+
+# 원격 비상정지 때 (control.py /estop): 그 자리 정지 → 사과를 쥐고 있으면 집은 자리에 되돌려 놓기 → 팔 내리기 → 모터 정지
+estop:
+  safe_park: true
+  speed_pct: 30
+  rest_xy_m: [0.21, -0.185]  # 쉬는 자세 = 트레이 가운데 위 (상자 위는 쌓인 사과에 닿을 수 있다) ★
+  rest_tip_z_m: 0.15         # 손가락끝 높이 — 트레이 사과(0.08) 위로 낮게 ★
