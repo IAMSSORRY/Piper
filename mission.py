@@ -788,6 +788,8 @@ def main():
         if not sim:
             from vision import open_roll_watcher
             roll = open_roll_watcher(cfg)
+        from live_detect import start_live_detections
+        live = start_live_detections(signals, cfg, dash)   # 대시보드 top 영상 위 실시간 사과 박스
         cfg["mission"]["apple_count"] = resolve_apple_count(cfg, args.apples)
         if args.serve:
             from control import Controller, serve
@@ -799,6 +801,8 @@ def main():
             try:
                 serve(ctl, cc.get("host", "0.0.0.0"), args.port or cc.get("port", 8765), tok)
             finally:
+                if live:
+                    live.stop()
                 dash.flush()
                 if roll:
                     roll.close()
@@ -818,6 +822,8 @@ def main():
             dash.mission("estop", reason=f"정지: {e}")
             raise
         finally:
+            if live:
+                live.stop()
             dash.flush()
             if roll:
                 roll.close()

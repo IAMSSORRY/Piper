@@ -14,6 +14,7 @@ MoveIt 없이 piper_sdk 직접 제어. 거리 m, 각도 rad.
 | `calibrate.py` | 카메라↔로봇 캘리브레이션 (로봇이 사과를 격자점에 놓으며) → `calib.yaml` |
 | `adaptive.py` | 굴림 → 하강 속도·놓는 높이 20% 하향 (하한, 3회 연속이면 중단, 연속 성공 시 복구) |
 | `dashboard.py` | SSORRY 서버 `/ingest/judge`, `/ingest/motion` 전송 (백그라운드) |
+| `live_detect.py` | 위 카메라 프레임마다 사과 박스를 대시보드 `/ingest/detections` 로 (영상 위 실시간 박스, 초당 최대 10번) |
 | `calib.yaml`, `color.yaml` | 현장 캘리브레이션 결과 (카메라·트레이를 옮기면 다시 만든다) |
 
 ## 준비

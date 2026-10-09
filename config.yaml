@@ -258,6 +258,9 @@ dashboard:
   cam: top                   # bbox 기준 카메라 = PIPER 라벨 top (Sony)
   token_env: SSORRY_TOKEN
   timeout_s: 2.0
+  live_detections: true      # 위 카메라 프레임마다 사과 박스를 /ingest/detections 로 (대시보드 영상 위 실시간 박스)
+  detections_hz: 10          # 초당 최대 전송 횟수
+  detections_timeout_s: 0.5  # 전송 타임아웃 — 실패해도 루프는 계속
 
 # 힘 이상 자동 정지 — 관절 부하(N·m)가 최근 평균에서 기준 넘게 persist_s 이상 벗어나면 그 자리 정지 후 미션 종료
 force_monitor:
