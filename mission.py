@@ -234,7 +234,9 @@ class Mission:
         self.r.down_to(bx, by, z_rel, spd)
         if self.roll:
             self.roll.release()              # 쥔 사과 위치 기억 + 관찰 시작
-        self.r.grip(True)
+        margin = p.get("release_open_margin_m")
+        held = self.r.gripper_width()
+        self.r.grip(True, width=held + margin if margin is not None else None)   # 조금만 연다
         self.r.wait(p["release_settle_s"])   # 팔 정지 상태로 관찰
         if self.roll and self.cfg["roll_camera"].get("mode") == "wrist":
             self.roll.stop()                 # 팔이 올라가기 전에 관찰 끝
