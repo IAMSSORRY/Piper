@@ -4,9 +4,6 @@
   python3 calibrate.py              # 자동: 로봇이 사과를 격자점에 내려놓고 카메라가 찾는다 (약 2분)
   python3 calibrate.py --hand       # 수동: 사과를 손으로 놓고, 팔을 손으로 끌어 사과 위에 대고 Enter
   python3 calibrate.py --verify     # 검증: 검출된 사과 위로 차례로 가서 멈춘다 (집지 않음)
-  python3 calibrate.py --floor      # 바닥 높이만: 트레이 바닥 · 상자 칸 바닥에 손가락끝을 대고 Enter
-  python3 calibrate.py --teach      # 위치 재기: 팔을 끌어 손가락끝을 트레이 모서리 4개 · 상자 칸 꼭짓점 6개 (xy 만) ·
-                                    #   마지막에 트레이 바닥 · 상자 바닥 (높이만) 에 대고 Enter → config.yaml 갱신
   SIM=true python3 calibrate.py     # 로봇·카메라 없이 순서만 확인
 
 자동 모드 준비: 트레이를 비우고(다른 사과가 있으면 부딪힌다) 사과 1개만 손에 든다.
@@ -269,164 +266,12 @@ def run_verify(robot, cfg):
         cam.close()
 
 
-TEACH_POINTS = (
-    [("tray", k, f"트레이 바닥 {k} 모서리 (화면 기준)") for k in ("좌상", "우상", "좌하", "우하")]
-    + [("box", (g, k), f"상자 '{g}' 칸 바닥 {k} 꼭짓점 (화면 기준)") for g in ("상", "중", "하") for k in ("좌상", "우하")]
-    + [("height", "tray_floor", "트레이 바닥 (높이만 쓴다)"), ("height", "box_floor", "상자 칸 바닥 (높이만 쓴다)")]
-)
-# 모서리·꼭짓점은 xy 만 쓴다 (테두리 위를 찍어도 된다). 높이는 마지막에 바닥을 한 번씩 찍어서 딴다.
-
-
-def _tip(robot):
-    """손가락끝 로봇 좌표 (그리퍼가 기울어 있어도 정확히: 관절 → 순기구학)."""
-    import ik
-    if robot.sim:
-        x, y, z = robot.current_pose()[:3]
-        return x, y, z - robot.tool_len
-    return tuple(float(v) for v in ik.fk_tip(robot.current_joints(), robot.tool_len)[0])
-
-
-def _wait_enter(robot, prompt):
-    """손가락끝 좌표를 계속 보여 주다가 Enter 면 그 값을 돌려준다. q = 중단."""
-    import select
-    print(f"\n▶ {prompt} — 손가락끝을 대고 Enter (q=중단)")
-    while True:
-        x, y, z = _tip(robot)
-        sys.stdout.write(f"\r   손가락끝 x {x:+.3f}  y {y:+.3f}  z {z:+.3f} m   ")
-        sys.stdout.flush()
-        r, _, _ = select.select([sys.stdin], [], [], 0.2)
-        if r:
-            s = sys.stdin.readline().strip().lower()
-            print()
-            if s == "q":
-                raise KeyboardInterrupt
-            return _tip(robot)
-
-
-def _set_line(text, pattern, repl):
-    import re
-    new, n = re.subn(pattern, repl, text, count=1, flags=re.M)
-    if n != 1:
-        raise RuntimeError(f"config.yaml 에서 못 찾음: {pattern}")
-    return new
-
-
-def run_teach(robot, cfg, config_path):
-    """팔 끝 티칭 버튼으로 드래그 모드에서: 점마다 손가락끝을 대고 Enter. 끝나면 config.yaml 을 고친다(백업 남김)."""
-    print("위치 재기: 팔 끝의 티칭 버튼을 눌러 드래그 모드로 바꾸고, 안내대로 손가락끝을 대고 Enter.")
-    pts = {}
-    for kind, key, prompt in TEACH_POINTS:
-        pts[(kind, key)] = _wait_enter(robot, prompt)
-        log.info("기록 %s: (%.3f, %.3f, %.3f)", prompt, *pts[(kind, key)])
-    tl = robot.tool_len
-    tray = {k: pts[("tray", k)] for k in ("좌상", "우상", "좌하", "우하")}
-    tray_floor = pts[("height", "tray_floor")][2]
-    box_floor = pts[("height", "box_floor")][2]
-    boxes = {}
-    for g in ("상", "중", "하"):
-        a, b = pts[("box", (g, "좌상"))], pts[("box", (g, "우하"))]
-        boxes[g] = {"xy": ((a[0] + b[0]) / 2, (a[1] + b[1]) / 2), "size": (abs(b[0] - a[0]), abs(b[1] - a[1])),
-                    "floor": box_floor}
-
-    print("\n===== 결과 (손가락끝 기준, m) =====")
-    for k, p in tray.items():
-        print(f"트레이 {k}: ({p[0]:.3f}, {p[1]:.3f})")
-    print(f"트레이 바닥 z {tray_floor:.3f} → pick.tray_z_m {tray_floor + tl:.3f} (지금 {cfg['pick']['tray_z_m']:.3f})")
-    for g, b in boxes.items():
-        print(f"'{g}' 칸 중심 ({b['xy'][0]:.3f}, {b['xy'][1]:.3f})  크기 {b['size'][0] * 1000:.0f}x{b['size'][1] * 1000:.0f}mm")
-    print(f"상자 바닥 z {box_floor:.3f} → floor_z_m {box_floor + tl:.3f}")
-    old_box = float(np.mean([b["floor_z_m"] for b in cfg["boxes"].values()]))
-    if abs(tray_floor + tl - cfg["pick"]["tray_z_m"]) > 0.02 or abs(box_floor + tl - old_box) > 0.02:
-        s = _ask(f"바닥 높이가 지금 값과 2cm 넘게 다릅니다 (트레이 {cfg['pick']['tray_z_m']:.3f}→{tray_floor + tl:.3f}, "
-                 f"상자 {old_box:.3f}→{box_floor + tl:.3f}). 높이도 바꿀까? (y=바꿈, Enter=높이는 그대로)", 120)
-        if (s or "").lower() != "y":
-            tray_floor = cfg["pick"]["tray_z_m"] - tl
-            for g, b in boxes.items():
-                b["floor"] = cfg["boxes"][g]["floor_z_m"] - tl
-            log.info("높이는 그대로 둔다 (xy 만 갱신)")
-
-    # 원본 기록
-    raw = {"created": time.strftime("%Y-%m-%d %H:%M:%S"), "tool_length_m": tl,
-           "points_tip_m": {f"{kind}:{key if isinstance(key, str) else '/'.join(key)}": [round(v, 4) for v in p]
-                            for (kind, key), p in pts.items()}}
-    with open(os.path.join(HERE, "teach_points.yaml"), "w") as f:
-        yaml.safe_dump(raw, f, allow_unicode=True, sort_keys=False)
-
-    # config.yaml 갱신 (주석 유지: 해당 줄의 값만 바꾼다)
-    with open(config_path) as f:
-        text = f.read()
-    bak = config_path + time.strftime(".bak-%H%M%S")
-    with open(bak, "w") as f:
-        f.write(text)
-    when = time.strftime("%H:%M")
-    ul, lr = tray["좌상"], tray["우하"]
-    text = _set_line(text, r"^(  corner1_xy_m: )\[[^\]]*\](.*)$", rf"\g<1>[{ul[0]:.3f}, {ul[1]:.3f}]   # 트레이 왼쪽 위 (화면 기준). {when} --teach")
-    text = _set_line(text, r"^(  corner2_xy_m: )\[[^\]]*\](.*)$", rf"\g<1>[{lr[0]:.3f}, {lr[1]:.3f}]   # 트레이 오른쪽 아래 (화면 기준). {when} --teach")
-    text = _set_line(text, r"^(  tray_z_m: )[0-9.]+(.*)$", rf"\g<1>{tray_floor + tl:.3f}\g<2>")
-    for g, b in boxes.items():
-        text = _set_line(text, rf"^(  {g}: \{{xy_m: )\[[^\]]*\]", rf"\g<1>[{b['xy'][0]:.3f}, {b['xy'][1]:.3f}]")
-        text = _set_line(text, rf"^(  {g}: \{{.*floor_z_m: )[0-9.]+", rf"\g<1>{b['floor'] + tl:.3f}")
-    # 상자 위치 확인 기준 (미션 시작 때 사진과 비교): 칸 중심 픽셀 = 지금 캘리브레이션으로 투영, 상자 모서리 = 새 사진
-    p = calib_path(cfg)
-    if os.path.exists(p):
-        calib = Calib.load(p)
-        px = {g: [int(round(v)) for v in calib.xy2px(*b["xy"])] for g, b in boxes.items()}
-        text = _set_line(text, r"^(    compartments_px: )\{[^}]*\}",
-                         "\\g<1>{" + ", ".join(f"{g}: [{u}, {v}]" for g, (u, v) in px.items()) + "}")
-        if _ask("팔을 카메라 시야 밖(트레이·상자 위가 아닌 곳)으로 치우고 Enter — 상자 기준 사진을 찍는다 (s=건너뜀)", 300) != "s":
-            from vision import find_box
-            cam = open_camera(cfg)
-            try:
-                img = cam.latest(after=time.monotonic() + cfg["vision"]["settle_s"])
-            finally:
-                cam.close()
-            cv2.imwrite(os.path.join(HERE, "snapshots", time.strftime("%H%M%S_teach_box.jpg")), img)
-            quad = find_box(img, cfg)
-            if quad is None:
-                log.warning("사진에서 상자를 못 찾음 → vision.box.ref_corners_px 는 그대로")
-            else:
-                text = _set_line(text, r"^(    ref_corners_px: )\[\[.*?\]\]",
-                                 "\\g<1>[" + ", ".join(f"[{int(u)}, {int(v)}]" for u, v in quad) + "]")
-    else:
-        log.warning("calib.yaml 이 없어 상자 칸 픽셀(compartments_px)은 그대로 — 먼저 python3 calibrate.py")
-    with open(config_path, "w") as f:
-        f.write(text)
-    log.info("config.yaml 갱신 (백업 %s), 원본 점 teach_points.yaml", os.path.basename(bak))
-
-
-def run_floor(robot, cfg, config_path):
-    """바닥 높이만: 트레이 바닥 · 상자 칸 바닥에 손가락끝을 대고 Enter → pick.tray_z_m, boxes.*.floor_z_m."""
-    print("바닥 높이 재기: 팔 끝의 티칭 버튼으로 드래그 모드에서, 손가락끝을 바닥에 대고 Enter.")
-    tl = robot.tool_len
-    tray = _wait_enter(robot, "트레이 바닥")[2]
-    box = _wait_enter(robot, "상자 칸 바닥")[2]
-    print(f"\n트레이 바닥 z {tray:.3f} → pick.tray_z_m {tray + tl:.3f} (지금 {cfg['pick']['tray_z_m']:.3f})")
-    old_box = {g: b["floor_z_m"] for g, b in cfg["boxes"].items()}
-    print(f"상자 바닥 z {box:.3f} → floor_z_m {box + tl:.3f} (지금 " + ", ".join(f"{g} {v:.3f}" for g, v in old_box.items()) + ")")
-    if (_ask("config.yaml 에 쓸까? (y=씀)", 120) or "").lower() != "y":
-        log.info("안 씀")
-        return
-    with open(config_path) as f:
-        text = f.read()
-    bak = config_path + time.strftime(".bak-%H%M%S")
-    with open(bak, "w") as f:
-        f.write(text)
-    text = _set_line(text, r"^(  tray_z_m: )[0-9.]+", rf"\g<1>{tray + tl:.3f}")
-    for g in cfg["boxes"]:
-        text = _set_line(text, rf"^(  {g}: \{{.*floor_z_m: )[0-9.]+", rf"\g<1>{box + tl:.3f}")
-    with open(config_path, "w") as f:
-        f.write(text)
-    log.info("config.yaml 갱신 (백업 %s)", os.path.basename(bak))
-
-
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default=os.path.join(HERE, "config.yaml"))
     g = ap.add_mutually_exclusive_group()
     g.add_argument("--hand", action="store_true", help="손으로 팔을 끌어서")
     g.add_argument("--verify", action="store_true", help="캘리브레이션 확인")
-    g.add_argument("--floor", action="store_true", help="트레이·상자 바닥 높이만 재서 config.yaml 갱신")
-    g.add_argument("--teach", action="store_true", help="트레이 모서리·상자 칸 꼭짓점·높이를 손가락끝으로 재서 config.yaml 갱신")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
@@ -437,13 +282,7 @@ def main():
     robot = Robot(cfg, sim=sim)
     obs = None
     try:
-        robot.connect(enable=not (args.hand or args.teach or args.floor))
-        if args.floor:
-            run_floor(robot, cfg, args.config)
-            return 0
-        if args.teach:
-            run_teach(robot, cfg, args.config)
-            return 0
+        robot.connect(enable=not args.hand)
         if args.verify:
             run_verify(robot, cfg)
             return 0

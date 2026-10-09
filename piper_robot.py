@@ -153,8 +153,6 @@ class Robot:
         self._soft_held = False   # 정지 요청 뒤 hold() 를 이미 보냈는가 (검사마다 다시 보내지 않게)
         self.jaw_yaw = None   # 집게가 닫히는 방향(로봇 xy 평면 각도, rad). None = 기본 자세 그대로
         self.tool_axis = None  # down_to/guarded_down 에서 공구가 가리킬 방향 (단위벡터). None = 수직(기울기 최소)
-        self.j5_fix = None     # down_to/guarded_down 에서 joint5(손목 꺾기)를 이 값에 고정. None = 자유
-        self.fm_scale = 1.0    # 힘 감지 기준 배율 (상자 안처럼 조심할 곳에서 낮춘다)
         fm = cfg.get("force_monitor", {})
         self.fm_on = bool(fm.get("enabled", False)) and not sim
         self.fm_thr0 = [float(v) for v in fm.get("threshold_nm", [2.0] * 6)]
@@ -176,18 +174,12 @@ class Robot:
             self.arm = SimPiper(self.cfg["sim"])
             log.info("[SIM] 실제 CAN 대신 시뮬레이터 사용")
         else:
-            # 다시 연결할 때(원격 해제 등) 이전 SDK 연결을 닫는다 — 안 닫으면 CAN 을 읽는 연결이 쌓인다
-            if self.arm is not None:
-                self.disconnect()
-                self.arm = None
             check_can(port)
             check_conflicts()
             try:
                 from piper_sdk import C_PiperInterface_V2
             except ImportError:
-                raise RobotError("piper_sdk 를 찾을 수 없습니다 — PIPER Studio 의 파이썬으로 실행하세요:\n"
-                                 "  ~/.venvs/piper-daemons/bin/python mission.py ...\n"
-                                 "  (그 파이썬이 없을 때만: pip3 install piper_sdk)")
+                raise RobotError("piper_sdk 미설치: pip3 install piper_sdk  (pip 없으면 sudo apt install python3-pip)")
             try:
                 self.arm = C_PiperInterface_V2(port)
             except Exception as e:
@@ -258,32 +250,12 @@ class Robot:
             time.sleep(0.01)
         log.error("!!! 비상정지 전송 완료 !!!")
 
-    def resume(self, timeout=3.0):
-        """비상정지 해제 (SDK EmergencyStop(0x02) == ResetPiper: 모터 전원이 잠깐 빠진다).
-
-        보낸 뒤 로봇 상태가 실제로 '비상정지'(0x01)에서 벗어날 때까지 기다린다 (중간에 한 번 더 보낸다).
-        예전에는 0.5초만 기다리고 넘어가서, 늦게 풀리면 바로 뒤 connect() 가 '비상정지 상태'로 거부했다."""
+    def resume(self):
+        """비상정지 해제 (SDK EmergencyStop(0x02) == ResetPiper: 모터 전원이 잠깐 빠진다)."""
         self.arm.EmergencyStop(0x02)
-        log.info("비상정지 해제 전송")
-        t0 = time.monotonic()
-        resent = False
-        while True:
-            time.sleep(0.1)
-            try:
-                code = int(self._status().arm_status)
-            except Exception:
-                code = None
-            if code is not None and code != 0x01:
-                break
-            if not resent and time.monotonic() - t0 > timeout / 2:
-                self.arm.EmergencyStop(0x02)
-                resent = True
-                log.warning("비상정지가 아직 안 풀림 — 해제 다시 전송")
-            if time.monotonic() - t0 > timeout:
-                log.error("비상정지 해제 후 %.0f초가 지나도 상태가 비상정지(0x01)", timeout)
-                break
         self._estopped.clear()
-        time.sleep(0.3)
+        time.sleep(0.5)
+        log.info("비상정지 해제 전송")
 
     def hold(self):
         """현재 위치를 목표로 다시 보내 그 자리에 세운다 (전원 유지, 낙하 없음). 섰으면 True.
@@ -293,15 +265,11 @@ class Robot:
         if self.arm is None or self._estopped.is_set():
             return False
         try:
-            # 지금 관절 각도를 그대로 목표로 보낸다 (MOVE_J). 예전에는 말단 자세(MOVE_P)를 보냈는데, 펌웨어가
-            # 그 자세의 관절 해를 다시 풀면서 손목(joint6)을 다른 쪽으로 크게 돌릴 수 있었다 (21:33 실측 170°) —
-            # '그 자리 정지'가 오히려 큰 동작이 될 수 있다. 관절 목표는 해가 하나라 정말 그 자리다.
-            q = [rad2sdk(v) for v in self.current_joints()]
+            x, y, z, rx, ry, rz = self.current_pose()
             for _ in range(3):
-                self.arm.MotionCtrl_2(CTRL_CAN, MOVE_J, 10, 0x00)
-                self.arm.JointCtrl(*q)
+                self.arm.MotionCtrl_2(CTRL_CAN, MOVE_P, 10, 0x00)
+                self.arm.EndPoseCtrl(m2sdk(x), m2sdk(y), m2sdk(z), rad2sdk(rx), rad2sdk(ry), rad2sdk(rz))
                 time.sleep(0.02)
-            x, y, z = self.current_pose()[:3]
             log.warning("현재 위치 정지 (%.3f, %.3f, %.3f)", x, y, z)
             return True
         except Exception as e:
@@ -352,7 +320,7 @@ class Robot:
     def _fm_speed(self, speed_pct):
         """속도별 힘 기준: 천천히(물체 근처) = 기본, 빠르게(공중) = 기본 × fast_scale (가속 때 부하가 커서)."""
         k = 1.0 if speed_pct is None or speed_pct <= self.fm_slow else self.fm_fast_k
-        self.fm_thr = [v * k * self.fm_scale for v in self.fm_thr0]
+        self.fm_thr = [v * k for v in self.fm_thr0]
 
     def _fm_reset(self):
         self.fm_base, self.fm_t, self.fm_over_since = None, None, None
@@ -643,9 +611,9 @@ class Robot:
         아니면(베이스 가까이·멀리) 구한 관절로 JointCtrl (최소 기울기)."""
         tip = z_flange - self.tool_len
         self._check_ws(x, y, z_flange)
-        q, tilt = self._ik(x, y, tip, axis=self.tool_axis, j5_fix=self.j5_fix)
-        # 집게 방향을 정했으면 항상 관절 명령 — 펌웨어 IK 는 손목(joint6)을 엉뚱한 쪽으로 크게 돌린다 (21:33 실측 170°)
-        if self.jaw_yaw is None and self.tool_axis is None and self.j5_fix is None and tilt < 1.0 and abs(q[4]) <= float(self.cfg.get("j5_firmware_max_rad", 1.10)):
+        q, tilt = self._ik(x, y, tip, axis=self.tool_axis)
+        # 집게 방향이나 기울기를 정했으면 항상 관절 명령 — 펌웨어 IK 는 손목(joint6)을 엉뚱한 쪽으로 크게 돌린다 (21:33 실측 170°)
+        if self.jaw_yaw is None and self.tool_axis is None and tilt < 1.0 and abs(q[4]) <= float(self.cfg.get("j5_firmware_max_rad", 1.10)):
             return self.move_to(x, y, z_flange, speed_pct, linear=True)
         if self.jaw_yaw is not None:
             q = self._q6_for_jaw(q, self.jaw_yaw, ref=self.current_joints()[5])
@@ -653,41 +621,29 @@ class Robot:
                                                  x, y, tip, tilt)
         self.move_joints(q, speed_pct)
 
-    def rotate_jaw(self, speed_pct):
-        """제자리에서 손목(joint6)만 돌려 집게 방향을 jaw_yaw 에 맞춘다 — 내려가면서 돌리지 않게 먼저 돌린다."""
-        if self.jaw_yaw is None:
-            return
-        q = self.current_joints()
-        q2 = self._q6_for_jaw(q, self.jaw_yaw, ref=q[5])
-        if abs(q2[5] - q[5]) > 0.02:
-            log.info("손목 먼저 돌림: joint6 %.2f → %.2f", q[5], q2[5])
-            self.move_joints(q2, speed_pct)
-
     def guarded_down(self, x, y, z_flange, speed_pct, thr_nm, skip_s=0.35, persist_s=0.06):
         """(x, y) 에서 z_flange 까지 천천히 내려가다가 '닿으면'(관절2·3 부하가 내려가는 동안의 평소 값에서
         thr_nm 넘게 바뀌면) 그 자리에 멈춘다. 반환 ('contact' | 'floor', 멈춘 플랜지 z).
         사과를 쌓을 때: 아래 사과(또는 바닥)에 닿은 곳에서 놓는다 — 개수로 높이를 짐작하지 않는다."""
         import ik
-        q, _ = self._ik(x, y, z_flange - self.tool_len, axis=self.tool_axis, j5_fix=self.j5_fix)
+        q, _ = self._ik(x, y, z_flange - self.tool_len, axis=self.tool_axis)
         if self.jaw_yaw is not None:
             q = self._q6_for_jaw(q, self.jaw_yaw, ref=self.current_joints()[5])
         t0 = time.monotonic()
-        since = None
-        hist = []                          # (시각, 부하) — 기준은 '조금 전' 부하 (자세가 바뀌며 천천히 변하는 건 따라간다)
+        base, since = None, None
+        samples = []
 
         def tick():
-            nonlocal since
+            nonlocal base, since
             now = time.monotonic()
             e = self._efforts()
             if now - t0 < skip_s:          # 출발 가속 구간은 안 본다
                 return
-            hist.append((now, e))
-            # 기준 = 0.6~0.25초 전 부하의 중앙값. 처음 정한 값에 고정하면 느리고 긴 하강(손목 꺾은 채 5%)에서
-            # 자세 변화로 부하가 천천히 0.25 N·m 넘게 바뀌어 공중에서 '닿음'으로 오판했다 (02:56 +87mm, 03:09 +94mm)
-            old = [s for t, s in hist if now - 0.6 <= t <= now - 0.25]
-            if len(old) < 3:
+            if base is None:
+                samples.append(e)
+                if len(samples) >= 5:      # 등속 하강 중 평소 부하
+                    base = [sorted(c)[len(c) // 2] for c in zip(*samples)]
                 return
-            base = [sorted(c)[len(c) // 2] for c in zip(*old)]
             dev = max(abs(e[j] - base[j]) for j in (1, 2))
             if dev > thr_nm:
                 since = since or now
@@ -700,10 +656,10 @@ class Robot:
         self.fm_on = False                 # 접촉 감지가 대신한다 (같은 신호로 비상정지하면 안 된다)
         try:
             self.move_joints(q, speed_pct, tick=tick)
-            return "floor", self.tip_z() + self.tool_len
+            return "floor", self.current_pose()[2]
         except _Contact:
             self.hold()
-            z = self.tip_z() + self.tool_len
+            z = self.current_pose()[2]
             log.info("닿음: 플랜지 z %.3f (목표 %.3f 보다 %.0fmm 위)", z, z_flange, (z - z_flange) * 1000)
             return "contact", z
         finally:
@@ -713,15 +669,10 @@ class Robot:
     # 그리퍼를 수직으로 세운 채로는 손가락끝 ~0.10m 위로 못 올라간다 (joint5 한계).
     # 상자 벽(0.14m)을 넘는 이동은 ik.py 로 관절 각도를 직접 구해 JointCtrl 로 보낸다 (약간 기울어짐).
 
-    def tip_z(self):
-        """손가락끝 z (공구가 기울어 있어도 정확히). z_flange 인자들은 '손가락끝 z + 공구 길이' 로 쓴다."""
-        import ik
-        return float(ik.fk_tip(self.current_joints(), self.tool_len)[0][2])
-
-    def _ik(self, x, y, ztip, axis=None, j5_fix=None):
+    def _ik(self, x, y, ztip, axis=None):
         import ik
         seeds = [self.current_joints()] + ik.SEEDS
-        r = ik.solve((x, y, ztip), self.tool_len, self.j5_max, seeds=seeds, axis=axis, j5_fix=j5_fix)
+        r = ik.solve((x, y, ztip), self.tool_len, self.j5_max, seeds=seeds, axis=axis)
         if r is None:
             raise RobotError(f"관절 해 없음: 손가락끝 ({x:.3f},{y:.3f},{ztip:.3f}) — 너무 멀거나 높음")
         return list(r[0]), r[1]
