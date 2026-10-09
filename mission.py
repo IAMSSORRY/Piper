@@ -226,7 +226,9 @@ class Mission:
         # 칸 안 자리: 칸마다 놓은 개수만큼 다음 자리로 (같은 자리에 겹쳐 놓으면 먼저 놓은 사과를 밀어낸다)
         slots = p.get("slots", [{"dxy_m": [0.0, 0.0], "dz_m": 0.0}])
         k = self.placed.get(grade, 0)
-        slot = slots[min(k, len(slots) - 1)]
+        if k >= len(slots):
+            raise RobotError(f"'{grade}' 칸이 꽉 찼습니다 ({k}개) — place.slots 를 늘리거나 칸을 비우세요")
+        slot = slots[k]
         self.placed[grade] = k + 1
         bx, by = b["xy_m"][0] + slot["dxy_m"][0], b["xy_m"][1] + slot["dxy_m"][1]
         if p.get("place_jaw_yaw_deg") is not None:   # 칸 안에서는 손가락이 이웃 사과 쪽으로 안 가게
