@@ -382,7 +382,8 @@ class BoxRollWatcher:
 
     def __init__(self, rc):
         self.rc = rc
-        self.cam = FrameSource(None, rc["device"], rc["width"], rc["height"], rc.get("fourcc"))
+        # PIPER Studio camerad 가 장치를 쥐고 있으면 직접 못 연다 → 스트림 먼저, 안 되면 장치
+        self.cam = FrameSource(rc.get("stream_url"), rc["device"], rc["width"], rc["height"], rc.get("fourcc"))
         self.before, self.track, self.t0 = [], [], None
         self._rec = threading.Event()
         self._th = threading.Thread(target=self._loop, daemon=True)
@@ -410,7 +411,16 @@ class BoxRollWatcher:
     def release(self):
         self.before_img, self.last_drop_m = None, None
         try:
-            img = self.cam.latest(timeout=1.0)
+            if self.cam._frame is None:
+                # 한 번도 프레임이 안 온 카메라: latest() 는 첫 프레임에 5초를 더 기다린다 → 놓을 때마다 6초 멈췄다.
+                # 놓기를 막지 않게 짧게만 보고 넘어간다 (굴림 판정은 '판정 불가')
+                end = time.monotonic() + 0.3
+                while self.cam._frame is None and time.monotonic() < end:
+                    time.sleep(0.01)
+                if self.cam._frame is None:
+                    raise IOError(f"프레임 없음 — 굴림 판정 생략 ({self.cam.url} / {self.cam.device})")
+            # 방금(0.6초 안) 들어온 프레임을 쓴다 — 새 프레임을 기다리면 2fps 스트림에서 최대 0.5초 멈춘다
+            img = self.cam.latest(after=time.monotonic() - 0.6, timeout=0.5)
             self.before_img = img
             self.before = color_blobs(img, self.rc)
         except IOError as e:

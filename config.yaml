@@ -112,7 +112,7 @@ boxes:
 place:
   descend_speed_pct: 35      # 상자 안으로 내려가는 속도 (적응형 조정 대상). 10-10 20 → 35 (너무 느림)
   release_height_m: 0.04     # 상자 바닥 위 놓는 높이 (적응형 조정 대상). 사과 아래면이 바닥에 닿을 정도가 이상적
-  release_settle_s: 0.6      # 그리퍼 연 뒤 정지 대기 (사과 안정 + 굴림 관찰). 21:45 1.2 → 0.6
+  release_settle_s: 0.4      # 그리퍼 연 뒤 정지 대기 (사과 안정 + 굴림 관찰). 21:45 1.2 → 0.6, 10-10 0.4 (놓기 ~1초)
   slow_zone_m: 0.04          # 놓는 높이 위 이 구간만 느리게 (descend_speed_pct)
   # 접촉 감지 놓기 (22:15): 바닥까지 천천히 내려가다 관절2·3 부하가 contact_nm 넘게 바뀌면 멈추고 거기서 놓는다.
   #   slots 의 dz 는 '빠르게 내려갈 한계'로만 쓴다 (실제 높이는 닿는 곳). 22:10 개수로 높이를 정해서 공중에서 떨어뜨렸다
@@ -229,7 +229,9 @@ calibration:
 roll_camera:
   enabled: true
   mode: wrist
-  device: /dev/v4l/by-path/pci-0000:00:14.0-usb-0:4.2:1.0-video-index0   # Global Shutter 손목 카메라 ★
+  # PIPER Studio camerad 가 장치를 쥐고 있어 직접 못 연다 → camerad 스트림 먼저 (10-10 확인: dev_video4 = 손목, 프레임 나옴)
+  stream_url: http://localhost/api/cameras/dev_video4/stream
+  device: /dev/v4l/by-path/pci-0000:00:14.0-usb-0:4.4:1.0-video-index0   # 스트림 안 될 때. USB 포트 4.2 → 4.4 로 바뀜 ★
   width: 640
   height: 480
   fourcc: MJPG
