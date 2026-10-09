@@ -552,9 +552,13 @@ def bruise_score(bgr, cfg):
     n, lab, st, _ = cv2.connectedComponentsWithStats(m)
     if n <= 1:
         return None, 0, img
-    k = 1 + int(np.argmax(st[1:, cv2.CC_STAT_AREA]))
-    if st[k, cv2.CC_STAT_AREA] < b["min_apple_px"]:
-        return None, int(st[k, cv2.CC_STAT_AREA]), img
+    # 들고 있는 사과 = 정해진 자리(apple_center_px)에 가장 가까운 큰 덩어리 (상자 안 사과·트레이 사과 제외)
+    _, _, _, cents = cv2.connectedComponentsWithStats(m)
+    cu, cv0 = b["apple_center_px"]
+    cand = [i for i in range(1, n) if st[i, cv2.CC_STAT_AREA] >= b["min_apple_px"]]
+    if not cand:
+        return None, int(st[1:, cv2.CC_STAT_AREA].max()), img
+    k = min(cand, key=lambda i: math.hypot(cents[i][0] - cu, cents[i][1] - cv0))
     apple = (lab == k).astype(np.uint8)
     # 아주 어두운 멍(V<60)은 색 마스크에서 빠져 구멍이 된다 → 사과 안에 갇힌 구멍은 채운다.
     # (볼록 껍질로 채우면 사과 위를 지나는 검은 손가락까지 멍으로 센다)
@@ -577,6 +581,21 @@ def bruise_score(bgr, cfg):
     out[dark.astype(bool)] = (255, 0, 255)
     cv2.putText(out, f"bruise {ratio * 100:.1f}%", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
     return ratio, int(apple.sum()), out
+
+
+def bruise_in_circle(bgr, cfg, u, v, r):
+    """트레이 위 사과(위에서 본 원) 안의 멍 비율 — 들기 전에 윗면 멍을 본다 (들면 손가락이 윗면을 가린다)."""
+    b = cfg["inspect"]["bruise"]
+    img = color_correct(bgr, cfg)
+    apple = np.zeros(img.shape[:2], np.uint8)
+    cv2.circle(apple, (int(u), int(v)), int(r * (1 - b.get("edge_frac", 0.12))), 1, -1)
+    apple = apple.astype(bool)
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    h, s, val = cv2.split(hsv)
+    med, med_s = float(np.median(val[apple])), float(np.median(s[apple]))
+    dark = apple & (val < med * b["dark_ratio_of_median"]) & (s < med_s * b["sat_ratio_of_median"])
+    dark = cv2.morphologyEx(dark.astype(np.uint8), cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+    return float(dark.sum()) / max(1, int(apple.sum()))
 
 
 # ---------- 트레이 위치 (사진으로, 매번) ----------
@@ -722,6 +741,7 @@ class CameraSignals:
             log.warning("사과 지름 %.0fmm > 그리퍼 열림 %.0fmm — 못 집을 수 있음", a.d_m * 1000, gw * 1000)
         self.cur = a
         self.cur_others = [(b.x, b.y, b.d_m / 2) for b in apples if b is not a]
+        self.top_bruise = bruise_in_circle(img, self.cfg, a.u, a.v, a.r)   # 윗면 멍 (들면 손가락이 가린다)
         log.info("검출 %d개 → 사과 (%.3f, %.3f) 지름 %.0fmm 등급 %s (빨강 %.2f, 흠 %.2f)",
                  len(ok), a.x, a.y, a.d_m * 1000, a.grade, a.red_ratio, a.dark_ratio)
         return a.x, a.y
@@ -747,10 +767,13 @@ class CameraSignals:
         if self.cur.grade == lo:
             return lo
         seen = [b for b in self.bruises if b is not None]
-        if not seen:
+        top = getattr(self, "top_bruise", None)
+        if not seen and top is None:
             log.warning("회전 검사에서 사과가 안 보였음 → 색으로만 판정 (%s)", self.cur.grade)
             return self.cur.grade
-        worst = max(seen)
+        worst = max(seen + ([top] if top is not None else []))
+        log.info("멍: 윗면(트레이) %s, 회전 검사 최대 %s", "-" if top is None else f"{top * 100:.1f}%",
+                 f"{max(seen) * 100:.1f}%" if seen else "-")
         self.cur.dark_ratio = worst
         thr = self.cfg["inspect"]["bruise"]["ratio_max"]
         g = self.cfg["inspect"]["bruise"].get("label", "중") if worst > thr else hi
