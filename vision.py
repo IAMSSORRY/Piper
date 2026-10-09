@@ -576,7 +576,8 @@ class CameraSignals:
         if a is None:
             return None
         return {"ratio": a.red_ratio, "threshold": self.v["grade"]["red_ratio_min"],
-                "bbox": [a.u - a.r, a.v - a.r, 2 * a.r, 2 * a.r]}
+                "bbox": [a.u - a.r, a.v - a.r, 2 * a.r, 2 * a.r],
+                "extra": {"dark_ratio": round(a.dark_ratio, 3), "dark_max": self.v["grade"]["dark_ratio_max"]}}
 
     def _box_roi(self, grade):
         bx, by = self.cfg["boxes"][grade]["xy_m"]
