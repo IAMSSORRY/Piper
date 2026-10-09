@@ -42,6 +42,10 @@ $PY vision.py --graycard           # 회색 카드 색 보정 (트레이 위 카
 $PY vision.py                      # 검출 화면 (빨강=상, 노랑=중)
 $PY calibrate.py                   # 트레이 비우고, 그리퍼가 열리면 사과 1개를 손가락 판 가운데에 → Enter
 $PY calibrate.py --verify          # 사과마다 위로 가서 멈춤 → 중심 확인 (어긋나면 pick.grasp_offset_m)
+$PY calibrate.py --floor           # 바닥 높이만 (트레이 바닥 → 상자 칸 바닥에 손가락끝을 대고 Enter) → tray_z_m, floor_z_m
+$PY calibrate.py --teach           # 티칭(드래그)으로 손가락끝을 대고 Enter: 트레이 모서리 4 (좌상·우상·좌하·우하) →
+                                   #   상자 칸 꼭짓점 6 (상·중·하 각 좌상·우하) — 여기까지 xy 만 → 바닥 높이 2 (트레이 바닥, 상자 바닥)
+                                   #   → config.yaml 갱신 (백업 config.yaml.bak-*), 원본 점 teach_points.yaml
 $PY mission.py                     # 본 미션 (calib.yaml 있으면 카메라 모드)
 $PY mission.py --apples 8          # 사과 개수 지정 (기본: 환경변수 MISSION_APPLE_COUNT → config mission.apple_count)
 $PY mission.py --apples all        # 트레이에 사과가 없을 때까지 (0 / all). 대시보드에는 apple_count: null
