@@ -139,7 +139,10 @@ class Robot:
         self.jaw_yaw = None   # 집게가 닫히는 방향(로봇 xy 평면 각도, rad). None = 기본 자세 그대로
         fm = cfg.get("force_monitor", {})
         self.fm_on = bool(fm.get("enabled", False)) and not sim
-        self.fm_thr = [float(v) for v in fm.get("threshold_nm", [2.0] * 6)]
+        self.fm_thr0 = [float(v) for v in fm.get("threshold_nm", [2.0] * 6)]
+        self.fm_thr = list(self.fm_thr0)
+        self.fm_slow = float(fm.get("slow_speed_max_pct", 30))     # 이 속도 이하 = 물체 근처 → 기준 그대로
+        self.fm_fast_k = float(fm.get("fast_scale", 2.5))          # 빠른 이동(공중) → 기준 × 이 배
         self.fm_tau = float(fm.get("baseline_s", 0.5))
         self.fm_hold = float(fm.get("persist_s", 0.1))
         self.fm_base = None
@@ -272,6 +275,11 @@ class Robot:
         h = self.arm.GetArmHighSpdInfoMsgs()
         return [getattr(h, f"motor_{i}").effort / 1000.0 for i in range(1, 7)]
 
+    def _fm_speed(self, speed_pct):
+        """속도별 힘 기준: 천천히(물체 근처) = 기본, 빠르게(공중) = 기본 × fast_scale (가속 때 부하가 커서)."""
+        k = 1.0 if speed_pct is None or speed_pct <= self.fm_slow else self.fm_fast_k
+        self.fm_thr = [v * k for v in self.fm_thr0]
+
     def _fm_reset(self):
         self.fm_base, self.fm_t, self.fm_over_since = None, None, None
         self.fm_peak = [0.0] * 6
@@ -394,6 +402,7 @@ class Robot:
         """말단을 (x,y,z)[m] 로. linear=True 면 직선(MOVE L), 아니면 MOVE P. 도착까지 블로킹."""
         self._check_ws(x, y, z)
         spd = int(max(1, min(100, round(speed_pct))))
+        self._fm_speed(spd)
         mode = MOVE_L if linear else MOVE_P
         rx, ry, rz = self.tool_rpy_for_jaw()
         cmd = (m2sdk(x), m2sdk(y), m2sdk(z), rad2sdk(rx), rad2sdk(ry), rad2sdk(rz))
@@ -428,6 +437,7 @@ class Robot:
             if not lo - 1e-6 <= v <= hi + 1e-6:
                 raise RobotError(f"joint{i + 1}={v:.3f}rad 가 한계 [{lo}, {hi}] 밖입니다")
         spd = int(max(1, min(100, round(speed_pct))))
+        self._fm_speed(spd)
         cmd = [rad2sdk(v) for v in joints]
         log.info("move_joints [%s] %d%%", ", ".join(f"{v:.2f}" for v in joints), spd)
 
@@ -460,6 +470,7 @@ class Robot:
         t0 = time.monotonic()
         last_send = -1.0
         last_w, still_since = None, None
+        self._fm_speed(None)     # 그리퍼: 기본 기준
         self._fm_reset()
         while True:
             self._check_fault()
