@@ -264,15 +264,25 @@ class Mission:
         self.r.jaw_yaw = None
 
     def inspect(self):
-        """검사 위치로 이동 후 카메라 촬영 대기. 등급 반환."""
+        """검사: 'rotate' 면 사과를 들어 위 카메라에 비추고 손목(joint6)을 돌려 가며 멍을 본다. 등급 반환."""
         i = self.cfg["inspect"]
-        x, y = i["xy_m"]
         log.info("== inspect")
         self.dash.mission("phase", phase="inspect")
-        self.r.transit_to(x, y, self.cfg["motion"]["transit_speed_pct"])
-        self.r.wait(i["wait_s"])
-        g = self.sig.grade()
-        if g not in grade_labels(self.cfg):
+        if i.get("mode") == "rotate" and hasattr(self.sig, "inspect_frame"):
+            q = [float(v) for v in i["joints_rad"]]
+            self.sig.bruises = []
+            self.r.move_joints(q, self.cfg["motion"]["transit_speed_pct"])
+            for k, q6 in enumerate(i["sweep_j6_rad"]):
+                self.r.move_joints(q[:5] + [float(q6)], i.get("sweep_speed_pct", 30))
+                self.r.wait(i.get("settle_s", 0.3))
+                self.sig.inspect_frame(f"{k}")
+            g = self.sig.final_grade()
+        else:
+            x, y = i["xy_m"]
+            self.r.transit_to(x, y, self.cfg["motion"]["transit_speed_pct"])
+            self.r.wait(i["wait_s"])
+            g = self.sig.grade()
+        if g not in grade_labels(self.cfg) and g != self.cfg["inspect"].get("bruise", {}).get("label", "중"):
             log.warning("등급 신호 없음/오류 (%r) → 기본 등급 %s", g, i["default_grade"])
             g = i["default_grade"]
         return g

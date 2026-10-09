@@ -537,9 +537,45 @@ def open_roll_watcher(cfg):
         return None
 
 
+# ---------- 멍 검사 (사과를 들어 위 카메라에 비춰 돌려 가며) ----------
+
+def bruise_score(bgr, cfg):
+    """들고 있는 사과(화면에서 가장 큰 빨강/노랑 덩어리)에서 '평소보다 어두운 갈색' 비율.
+    반환 (비율, 사과 픽셀 수, 표시 이미지). 사과가 안 보이면 (None, 0, img)."""
+    v = cfg["vision"]
+    b = cfg["inspect"]["bruise"]
+    img = color_correct(bgr, cfg)
+    red, yellow, _ = _masks(img, v)
+    m = ((red | yellow).astype(np.uint8) * 255)
+    m &= _roi_mask(img.shape, b["roi_px"])
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25)))
+    n, lab, st, _ = cv2.connectedComponentsWithStats(m)
+    if n <= 1:
+        return None, 0, img
+    k = 1 + int(np.argmax(st[1:, cv2.CC_STAT_AREA]))
+    if st[k, cv2.CC_STAT_AREA] < b["min_apple_px"]:
+        return None, int(st[k, cv2.CC_STAT_AREA]), img
+    apple = (lab == k).astype(np.uint8)
+    # 가장자리(손가락 그림자·반사)는 빼고 안쪽만 본다: 가장자리에서 반지름의 edge_frac 이상 들어간 곳
+    dist = cv2.distanceTransform(apple, cv2.DIST_L2, 5)
+    apple = dist >= dist.max() * b.get("edge_frac", 0.25)
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    h, s, val = cv2.split(hsv)
+    med = float(np.median(val[apple]))
+    med_s = float(np.median(s[apple]))
+    # 멍 = 어둡고(밝기↓) + 칙칙하다(채도↓, 갈색). 그림자·꼭지 오목한 곳은 어두워도 채도가 그대로라 빠진다
+    dark = apple & (val < med * b["dark_ratio_of_median"]) & (s < med_s * b["sat_ratio_of_median"])
+    dark = cv2.morphologyEx(dark.astype(np.uint8), cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+    ratio = float(dark.sum()) / max(1, int(apple.sum()))
+    out = img.copy()
+    out[dark.astype(bool)] = (255, 0, 255)
+    cv2.putText(out, f"bruise {ratio * 100:.1f}%", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+    return ratio, int(apple.sum()), out
+
+
 # ---------- 트레이 위치 (사진으로, 매번) ----------
 
-def find_tray_floor(bgr, cfg):
+def find_tray_floor(bgr, cfg, inset=None):
     """청록 트레이를 찾아 '바닥 가장자리' 사각형(픽셀 4점)을 돌려준다. 윗테두리에서 wall_inset_px 만큼 안쪽.
     (테두리는 바닥보다 높아 위에서 보면 바깥으로 보인다 — 벽 여유를 크게 잡는 실수를 막는다.) 못 찾으면 None."""
     t = cfg["vision"]["tray"]
@@ -556,7 +592,7 @@ def find_tray_floor(bgr, cfg):
     if cv2.contourArea(c) < t["min_area_px"]:
         return None
     (cx, cy), (w, hh), ang = cv2.minAreaRect(c)
-    k = t["wall_inset_px"]
+    k = t["wall_inset_px"] if inset is None else inset
     return cv2.boxPoints(((cx, cy), (max(1.0, w - 2 * k), max(1.0, hh - 2 * k)), ang))
 
 
@@ -637,6 +673,7 @@ class CameraSignals:
         self.cur = None
         self.box_img = None        # 놓기 전 상자 상태 (apple_xy 때 같이 찍음)
         self.bad_xy = []           # 못 집은 사과 위치 — 다시 고르지 않는다
+        self.bruises = []          # 회전 검사 멍 비율
         self.snap_dir = os.path.join(HERE, "snapshots")
         os.makedirs(self.snap_dir, exist_ok=True)
 
@@ -656,7 +693,9 @@ class CameraSignals:
         else:
             log.warning("트레이를 사진에서 못 찾음 → 설정의 tray_roi_px 로 벽 계산")
             self.tray_walls, self.tray_center = None, None
-        apples = apply_calib(detect_apples(img, self.cfg), self.calib)
+        rim = find_tray_floor(img, self.cfg, inset=-10)   # 트레이를 따라 사과 찾는 영역 (조금 넉넉히)
+        roi = rim.astype(int).tolist() if rim is not None else None
+        apples = apply_calib(detect_apples(img, self.cfg, roi=roi), self.calib)
         ws = self.cfg["workspace"]
         ok = [a for a in apples if ws["x"][0] <= a.x <= ws["x"][1] and ws["y"][0] <= a.y <= ws["y"][1]
               and math.hypot(a.x, a.y) <= ws.get("max_reach_xy_m", 9.0)]
@@ -683,6 +722,33 @@ class CameraSignals:
 
     def grade(self):
         return self.cur.grade if self.cur else None
+
+    def inspect_frame(self, tag):
+        """회전 검사 한 장: 멍 비율 기록."""
+        img = self.cam.latest(after=time.monotonic() + 0.05)
+        ratio, px, out = bruise_score(img, self.cfg)
+        self._save(f"inspect_{tag}", out)
+        self.bruises.append(ratio)
+        log.info("  검사 %s: 사과 %dpx, 멍 %s", tag, px, "안 보임" if ratio is None else f"{ratio * 100:.1f}%")
+        return ratio
+
+    def final_grade(self):
+        """노랑 → 낮은 등급(하). 빨강: 회전 검사에서 멍이 기준 넘으면 중, 아니면 상."""
+        if self.cur is None:
+            return None
+        hi, lo = self.v["grade"].get("labels", ["상", "하"])
+        if self.cur.grade == lo:
+            return lo
+        seen = [b for b in self.bruises if b is not None]
+        if not seen:
+            log.warning("회전 검사에서 사과가 안 보였음 → 색으로만 판정 (%s)", self.cur.grade)
+            return self.cur.grade
+        worst = max(seen)
+        self.cur.dark_ratio = worst
+        thr = self.cfg["inspect"]["bruise"]["ratio_max"]
+        g = self.cfg["inspect"]["bruise"].get("label", "중") if worst > thr else hi
+        log.info("멍 최대 %.1f%% (기준 %.1f%%) → %s", worst * 100, thr * 100, g)
+        return g
 
     def locate_boxes(self):
         """상자 칸 중심을 사진으로 다시 잡는다 (미션 시작 때, 팔이 상자를 안 가릴 때 부른다)."""
