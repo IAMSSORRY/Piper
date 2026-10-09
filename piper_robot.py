@@ -809,6 +809,9 @@ class SimPiper:
         if t != self.t_pose:
             self.slog.debug("[SIM] EndPoseCtrl%s mode=%d spd=%d", tuple(t), self.mode, self.spd)
             self.t_pose, self.t_joints = t, None
+            if self.fk_ok and math.dist([v / 1e6 for v in t[:3]], [v / 1e6 for v in self.pose[:3]]) < 0.003:
+                self.t_pose, self.unreach = None, False     # hold (지금 자리) — 기울어진 자세 그대로 선다
+                return
             if self.fk_ok:   # 실기처럼 관절로 움직인다: 펌웨어 IK 대신 ik.solve (그리퍼 수직 가정)
                 import ik
                 r = ik.solve((sdk2m(X), sdk2m(Y), sdk2m(Z) - self.tool_len), self.tool_len, 1.22,

@@ -677,7 +677,14 @@ def main():
             robot.connect(enable=False)
             robot.exit_teach()
             return 0
-        robot.connect(enable=not args.read_pose)
+        if args.serve:   # 원격 제어: 비상정지 상태여도 서버는 뜬다 (/resume 으로 해제)
+            try:
+                robot.connect(enable=True)
+            except RobotFault as e:
+                log.warning("로봇이 비상정지/고장 상태로 시작 — /resume 으로 해제: %s", e)
+                robot._estopped.set()
+        else:
+            robot.connect(enable=not args.read_pose)
         if args.check:
             log.info("점검 완료: 현재 xyz %s", tuple(round(v, 3) for v in robot.current_pose()[:3]))
             return 0
@@ -704,6 +711,8 @@ def main():
         if args.serve:
             from control import Controller, serve
             ctl = Controller(robot, cfg, lambda: Mission(robot, cfg, AdaptiveTuner(cfg), signals, dash, roll), dash)
+            if robot._estopped.is_set():
+                ctl.state, ctl.error = "estopped", "시작할 때 이미 비상정지 상태"
             cc = cfg.get("control", {})
             tok = os.environ.get(cfg.get("dashboard", {}).get("token_env", "SSORRY_TOKEN"), "")
             try:

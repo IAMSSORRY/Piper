@@ -44,6 +44,13 @@ class Controller:
         self.state, self.error = state, error
         log.info("상태 → %s%s", state, f" ({error})" if error else "")
         self.dash.mission("control", state=state, error=error)
+        if state in ("estopped", "error"):
+            # 웹(대시보드 서버)은 'estop' 이벤트로 비상정지 화면을 띄운다 — 어떤 이유로 멈췄든 보낸다
+            self.dash.mission("estop", reason=error or "정지")
+        elif state == "running" and self.mission is not None and self.mission.next_i:
+            # 이어하기: 'apple' 이벤트가 와야 웹이 비상정지 → 진행 중으로 돌아간다
+            self.dash.mission("apple", index=self.mission.next_i + 1,
+                              total=self.cfg["mission"].get("apple_count"))
 
     # ---- 미션 실행 (백그라운드) ----
     def _work(self, resume):
@@ -109,8 +116,6 @@ class Controller:
         with self._lock:
             if self.state == "running":
                 return False, "실행 중 — 해제할 것이 없음"
-            if self.mission is None:
-                return False, "이어 할 미션이 없음 (/start)"
             if self._th is not None:
                 self._th.join(timeout=5)
             if self.state == "estopped" or self.r._estopped.is_set():
@@ -122,8 +127,10 @@ class Controller:
             except RobotError as e:
                 self._set("estopped" if isinstance(e, RobotFault) else "error", f"해제 실패: {e}")
                 return False, str(e)
-            if self.mission.next_i is None or self.state == "done":
-                return False, "미션이 이미 끝남 (/start)"
+            if self.mission is None or self.state == "done":   # 이어 할 미션이 없으면 해제만 하고 대기
+                self.r.go_home()
+                self._set("idle")
+                return True, "비상정지 해제 — 대기 (/start 로 시작)"
             self.mission.stop_requested = False
             self._launch(resume=True)
             return True, f"사과 {self.mission.next_i + 1}번째부터 이어서"
