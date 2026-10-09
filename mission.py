@@ -161,6 +161,10 @@ class ManualSignals:
 
 # ---------- 시퀀스 ----------
 
+class CompartmentFull(RobotError):
+    """놓을 칸에 빈 자리가 없다 — 사과를 집은 자리에 되돌리고 다음 사과로."""
+
+
 class NeedRedetect(Exception):
     """사과를 굴려서 옮겼다 — 다시 찍고 다시 집는다."""
 
@@ -200,6 +204,7 @@ class Mission:
         self.r, self.cfg, self.tuner, self.sig = robot, cfg, tuner, signals
         self.dash = dash or Dashboard({})
         self.placed = {}      # 칸별 놓은 개수
+        self.used_slots = {}  # 칸별 이번 미션에 직접 놓은 자리 번호 (사진에 안 보여도 그 위에는 안 놓는다)
         self.results, self.next_i, self.stop_requested, self.t0 = [], 0, False, time.monotonic()
         self.last_pick = None
         self.last_drop = None  # 운반 중 낙하 표시
@@ -330,20 +335,74 @@ class Mission:
             g = i["default_grade"]
         return g
 
+    def _free_slot(self, grade, slots):
+        """칸 안 빈 자리 번호 (slots 순서대로 첫 빈 자리). 사과 위에 얹지 않는다.
+
+        찬 자리 = (1) 위 카메라 사진에서 그 칸 사과가 가장 가까운 자리 (2) 이번 미션에 로봇이 직접 놓은 자리.
+        둘을 합친다 — 홈 자세에서 팔이 상자를 가려 사진에 안 보여도 자기가 놓은 사과 위에는 놓지 않는다.
+        빈 자리가 없으면 RobotError (칸을 비워야 한다)."""
+        taken = set(self.used_slots.get(grade, set()))
+        seen = None
+        f = getattr(self.sig, "box_apples", None)
+        if f is not None:
+            try:
+                seen = f(grade)
+            except Exception as e:   # 사진 없음 등 — 직접 놓은 기록만 쓴다
+                log.warning("상자 사진으로 빈 자리 찾기 실패 → 놓은 기록만 씀: %s", e)
+        if seen:
+            cents = {g: bb["xy_m"] for g, bb in self.cfg["boxes"].items()}
+            bx, by = cents[grade]
+            pts = [(bx + sl["dxy_m"][0], by + sl["dxy_m"][1]) for sl in slots]
+            near = self.cfg["place"].get("slot_taken_m", 0.07)
+            for x, y in seen:
+                # 다른 칸 사과는 빼고(가장 가까운 칸 중심이 이 칸인 것만), 자리에서 사과 지름 안에 있으면 그 자리는 참
+                # (가운데로 굴러간 사과는 양쪽 자리를 다 막는다 — 가장 가까운 자리 하나만 막으면 그 사과에 걸쳐 놓는다)
+                if min(cents, key=lambda g: math.hypot(x - cents[g][0], y - cents[g][1])) != grade:
+                    continue
+                taken.update(i for i, (px, py) in enumerate(pts) if math.hypot(x - px, y - py) < near)
+        free = [i for i in range(len(slots)) if i not in taken]
+        log.info("'%s' 칸 자리: 찬 자리 %s (사진 %s개) → %s", grade, sorted(i + 1 for i in taken) or "-",
+                 "?" if seen is None else len(seen), f"{free[0] + 1}번" if free else "빈 자리 없음")
+        if not free:
+            raise CompartmentFull(f"'{grade}' 칸에 빈 자리가 없습니다 — 칸을 비우세요 (위에 얹지 않는다)")
+        return free[0]
+
+    def _end_tilt(self, slot):
+        """끝자리: 손가락끝은 자리에, 몸통(플랜지)은 칸 가운데 쪽으로 기울인다. 반환 공구 축 단위벡터 (필요 없으면 None)."""
+        p = self.cfg["place"]
+        dx, dy = slot["dxy_m"]
+        d = math.hypot(dx, dy)
+        room = max(0.0, (p.get("compartment_len_m", 0.195) - p.get("body_length_m", 0.20)) / 2 - p.get("body_margin_m", 0.005))
+        if d <= room:
+            return None
+        sn = min((d - room) / self.r.tool_len, math.sin(math.radians(p.get("max_end_tilt_deg", 30))))
+        c = math.sqrt(1 - sn * sn)
+        log.info("끝자리: 손을 %.0f° 비스듬히 (몸통은 가운데 쪽으로 %.0fmm)", math.degrees(math.asin(sn)), sn * self.r.tool_len * 1000)
+        return (sn * dx / d, sn * dy / d, -c)
+
     def place(self, grade):
+        """등급 상자 위 → 하강 → 놓기 → 상승. 기울이기는 놓기 안에서만."""
+        try:
+            return self._place(grade)
+        finally:
+            self.r.tool_axis = None
+
+    def _place(self, grade):
         """등급 상자 위 → 하강 → 놓기 → 상승."""
         b, p = self.cfg["boxes"][grade], self.cfg["place"]
         # 칸 안 자리: 칸마다 놓은 개수만큼 다음 자리로 (같은 자리에 겹쳐 놓으면 먼저 놓은 사과를 밀어낸다)
         slots = p.get("slots", [{"dxy_m": [0.0, 0.0], "dz_m": 0.0}])
         k = self.placed.get(grade, 0)
-        if k >= len(slots):
-            raise RobotError(f"'{grade}' 칸이 꽉 찼습니다 ({k}개) — place.slots 를 늘리거나 칸을 비우세요")
-        slot = slots[k]
+        j = self._free_slot(grade, slots)
+        slot = slots[j]
         self.placed[grade] = k + 1
+        self.used_slots.setdefault(grade, set()).add(j)
         bx, by = b["xy_m"][0] + slot["dxy_m"][0], b["xy_m"][1] + slot["dxy_m"][1]
+        # 끝자리는 손을 비스듬히 넣어 그리퍼 몸통(~180mm)이 칸 끝벽(195mm 칸)에 안 닿게 한다
+        self.r.tool_axis = self._end_tilt(slot)
         if p.get("place_jaw_yaw_deg") is not None:   # 칸 안에서는 손가락이 이웃 사과 쪽으로 안 가게
             self.r.jaw_yaw = math.radians(p["place_jaw_yaw_deg"])
-        log.info("'%s' 칸 %d번째 자리 (%.3f, %.3f)%s", grade, k + 1, bx, by,
+        log.info("'%s' 칸 %d번 자리 (%.3f, %.3f)%s", grade, j + 1, bx, by,
                  " — 위에 얹음 +%.0fmm" % (slot["dz_m"] * 1000) if slot["dz_m"] else "")
         z_lift = self.r.lift_z(bx, by)
         z_floor = b["floor_z_m"] + self.tuner.release_h       # 바닥에 놓을 때 높이
@@ -380,6 +439,25 @@ class Mission:
             self.roll.stop()                 # 팔이 올라가기 전에 관찰 끝
         self.r.down_to(bx, by, z_lift, p["lift_speed_pct"])
 
+    def return_held(self, spd, why):
+        """쥔 사과를 집었던 자리(last_pick, 없으면 트레이 가운데)에 살살 내려놓고 올라온다."""
+        p, c = self.cfg["pick"], self.cfg
+        if self.last_pick:
+            x, y, jaw = self.last_pick
+        else:
+            (x1, y1), (x2, y2) = c["calibration"]["corner1_xy_m"], c["calibration"]["corner2_xy_m"]
+            x, y, jaw = (x1 + x2) / 2, (y1 + y2) / 2, None
+        log.warning("%s: 쥐고 있던 사과를 원래 자리 (%.3f, %.3f) 에 되돌려 놓는다", why, x, y)
+        self.r.tool_axis = None
+        self.r.transit_to(x, y, spd)
+        self.r.jaw_yaw = jaw
+        how, z = self.r.guarded_down(x, y, p["tray_z_m"] + p["grasp_height_m"] + 0.005,
+                                     p["descend_speed_pct"], c["place"].get("contact_nm", 0.5))
+        self.r.grip(True, width=self.r.gripper_width() + 0.012)
+        self.r.down_to(x, y, max(self.r.lift_z(x, y), z + 0.05), spd)
+        self.r.jaw_yaw = None
+        self.last_pick = None
+
     def safe_park(self):
         """정리 후 정지(/park): 사과를 쥐고 있으면 집었던 자리에 되돌려 놓고, 팔을 낮은 쉬는 자세로 내린다.
         사과를 되돌렸으면 True."""
@@ -387,21 +465,8 @@ class Mission:
         p, c = self.cfg["pick"], self.cfg
         spd = c.get("estop", {}).get("speed_pct", 30)
         if self.r.holding(c["gripper"]["min_grasp_width_m"]):
-            if self.last_pick:
-                x, y, jaw = self.last_pick
-            else:
-                (x1, y1), (x2, y2) = c["calibration"]["corner1_xy_m"], c["calibration"]["corner2_xy_m"]
-                x, y, jaw = (x1 + x2) / 2, (y1 + y2) / 2, None
-            log.warning("비상정지: 쥐고 있던 사과를 원래 자리 (%.3f, %.3f) 에 되돌려 놓는다", x, y)
             self.dash.mission("phase", phase="estop_return")
-            self.r.transit_to(x, y, spd)
-            self.r.jaw_yaw = jaw
-            how, z = self.r.guarded_down(x, y, p["tray_z_m"] + p["grasp_height_m"] + 0.005,
-                                         p["descend_speed_pct"], c["place"].get("contact_nm", 0.5))
-            self.r.grip(True, width=self.r.gripper_width() + 0.012)
-            self.r.down_to(x, y, max(self.r.lift_z(x, y), z + 0.05), spd)
-            self.r.jaw_yaw = None
-            self.last_pick = None
+            self.return_held(spd, "비상정지")
             returned = True
         # 팔 내리기: 쉬는 자세 (낮게 — 모터 전원이 빠져도 덜 떨어진다)
         rx, ry = c.get("estop", {}).get("rest_xy_m", c["home_xy_m"])
@@ -512,7 +577,18 @@ class Mission:
                 continue
             grade = self.inspect()
             self.dash.judge(grade, getattr(self.sig, "judge_info", lambda: None)())
-            self.place(grade)
+            try:
+                self.place(grade)
+            except CompartmentFull as e:   # 칸이 찼다 — 위에 얹지 않고 사과를 되돌린 뒤 다음 사과로
+                log.warning("사과 %d: %s → 집은 자리에 되돌리고 다음 사과", i + 1, e)
+                self.dash.mission("skip", index=i + 1, reason=str(e))
+                self.return_held(self.cfg["motion"]["transit_speed_pct"], "칸 가득")
+                if hasattr(self.sig, "mark_bad"):
+                    self.sig.mark_bad()          # 되돌린 사과를 다시 집지 않게
+                results.append((i + 1, grade, "칸 가득(되돌림)"))
+                self.next_i = i + 1
+                self.r.jaw_yaw = None
+                continue
             self.last_pick = None
             self.next_i = i + 1                  # 놓았으면 이 사과는 끝 (뒤에서 멈춰도 다시 하지 않는다)
             self.r.jaw_yaw = None

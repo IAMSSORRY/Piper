@@ -52,14 +52,16 @@ def tilt_deg(axis):
     return math.degrees(math.acos(max(-1.0, min(1.0, -axis[2]))))
 
 
-def solve(tip_xyz, tool_len, j5_max=1.20, seeds=None, iters=300):
+def solve(tip_xyz, tool_len, j5_max=1.20, seeds=None, iters=300, axis=None, j5_fix=None):
     """손가락 끝을 tip_xyz 에 두는 관절 6개. joint5 ≤ j5_max, 그 안에서 기울기 최소.
+    axis(단위벡터, 공구가 가리키는 방향)를 주면 수직 대신 그 방향에 가장 가깝게 (반환 기울기 = 그 방향에서 벗어난 각).
+    j5_fix 를 주면 joint5(손목 꺾기)를 그 값에 고정하고 나머지 관절로 위치를 맞춘다.
     위치는 정확히 맞추고(주 과제), 기울기는 위치를 안 건드리는 방향(영공간)으로만 줄인다.
     반환 (q, tilt_deg) 또는 None (위치 오차 2mm 이내 해 없음)."""
     t = np.asarray(tip_xyz, float)
     lim = JOINT_LIMITS.copy()
-    lim[4] = (-j5_max, j5_max)
-    down = np.array([0.0, 0.0, -1.0])
+    lim[4] = (-j5_max, j5_max) if j5_fix is None else (j5_fix - 1e-3, j5_fix + 1e-3)
+    down = np.array([0.0, 0.0, -1.0]) if axis is None else np.asarray(axis, float) / np.linalg.norm(axis)
     best = None
     for s in (seeds or SEEDS):
         q = np.clip(np.array(s, float), lim[:, 0], lim[:, 1])
@@ -88,7 +90,7 @@ def solve(tip_xyz, tool_len, j5_max=1.20, seeds=None, iters=300):
                 break
         p, a, _ = fk_tip(q, tool_len)
         if np.linalg.norm(p - t) < 0.002:
-            tl = tilt_deg(a)
+            tl = math.degrees(math.acos(max(-1.0, min(1.0, float(a @ down)))))
             if best is None or tl < best[1]:
                 best = (q.copy(), tl)
     return best

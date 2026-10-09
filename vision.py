@@ -838,6 +838,13 @@ class CameraSignals:
                for t in np.linspace(0, 2 * math.pi, 24, endpoint=False)]
         return [[int(u), int(v)] for u, v in pts]
 
+    def box_apples(self, grade):
+        """그 칸 근처에 보이는 사과 [(x, y)] (로봇 좌표) — 놓을 빈 자리 찾기용 (mission._free_slot).
+        팔을 비킨 채 찍은 마지막 사진(apple_xy 의 box_img)을 쓴다. 사진이 없으면 None."""
+        if self.box_img is None:
+            return None
+        return [(a.x, a.y) for a in self._box_apples(grade, self.box_img)]
+
     def _box_apples(self, grade, img):
         return apply_calib(detect_apples(img, self.cfg, roi=self._box_roi(grade)), self.calib)
 

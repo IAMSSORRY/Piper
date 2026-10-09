@@ -152,6 +152,7 @@ class Robot:
         self._soft_stop = threading.Event()
         self._soft_held = False   # 정지 요청 뒤 hold() 를 이미 보냈는가 (검사마다 다시 보내지 않게)
         self.jaw_yaw = None   # 집게가 닫히는 방향(로봇 xy 평면 각도, rad). None = 기본 자세 그대로
+        self.tool_axis = None  # down_to/guarded_down 에서 공구가 가리킬 방향 (단위벡터). None = 수직(기울기 최소)
         fm = cfg.get("force_monitor", {})
         self.fm_on = bool(fm.get("enabled", False)) and not sim
         self.fm_thr0 = [float(v) for v in fm.get("threshold_nm", [2.0] * 6)]
@@ -610,9 +611,9 @@ class Robot:
         아니면(베이스 가까이·멀리) 구한 관절로 JointCtrl (최소 기울기)."""
         tip = z_flange - self.tool_len
         self._check_ws(x, y, z_flange)
-        q, tilt = self._ik(x, y, tip)
-        # 집게 방향을 정했으면 항상 관절 명령 — 펌웨어 IK 는 손목(joint6)을 엉뚱한 쪽으로 크게 돌린다 (21:33 실측 170°)
-        if self.jaw_yaw is None and tilt < 1.0 and abs(q[4]) <= float(self.cfg.get("j5_firmware_max_rad", 1.10)):
+        q, tilt = self._ik(x, y, tip, axis=self.tool_axis)
+        # 집게 방향이나 기울기를 정했으면 항상 관절 명령 — 펌웨어 IK 는 손목(joint6)을 엉뚱한 쪽으로 크게 돌린다 (21:33 실측 170°)
+        if self.jaw_yaw is None and self.tool_axis is None and tilt < 1.0 and abs(q[4]) <= float(self.cfg.get("j5_firmware_max_rad", 1.10)):
             return self.move_to(x, y, z_flange, speed_pct, linear=True)
         if self.jaw_yaw is not None:
             q = self._q6_for_jaw(q, self.jaw_yaw, ref=self.current_joints()[5])
@@ -625,7 +626,7 @@ class Robot:
         thr_nm 넘게 바뀌면) 그 자리에 멈춘다. 반환 ('contact' | 'floor', 멈춘 플랜지 z).
         사과를 쌓을 때: 아래 사과(또는 바닥)에 닿은 곳에서 놓는다 — 개수로 높이를 짐작하지 않는다."""
         import ik
-        q, _ = self._ik(x, y, z_flange - self.tool_len)
+        q, _ = self._ik(x, y, z_flange - self.tool_len, axis=self.tool_axis)
         if self.jaw_yaw is not None:
             q = self._q6_for_jaw(q, self.jaw_yaw, ref=self.current_joints()[5])
         t0 = time.monotonic()
@@ -668,10 +669,10 @@ class Robot:
     # 그리퍼를 수직으로 세운 채로는 손가락끝 ~0.10m 위로 못 올라간다 (joint5 한계).
     # 상자 벽(0.14m)을 넘는 이동은 ik.py 로 관절 각도를 직접 구해 JointCtrl 로 보낸다 (약간 기울어짐).
 
-    def _ik(self, x, y, ztip):
+    def _ik(self, x, y, ztip, axis=None):
         import ik
         seeds = [self.current_joints()] + ik.SEEDS
-        r = ik.solve((x, y, ztip), self.tool_len, self.j5_max, seeds=seeds)
+        r = ik.solve((x, y, ztip), self.tool_len, self.j5_max, seeds=seeds, axis=axis)
         if r is None:
             raise RobotError(f"관절 해 없음: 손가락끝 ({x:.3f},{y:.3f},{ztip:.3f}) — 너무 멀거나 높음")
         return list(r[0]), r[1]
