@@ -513,7 +513,7 @@ class Robot:
             width = float(g["open_width_m"] if open_ else g["close_width_m"])
         effort = int(round(float(g["effort_nm"]) * 1000))
         timeout = timeout or float(g["timeout_s"])
-        log.info("grip %s (목표 %.1fmm, 힘 %.2fN·m)", "open" if open_ else "close", width * 1000, effort / 1000)
+        log.info("grip %s (목표 %.1fmm, 힘 %.1fN·m)", "open" if open_ else "close", width * 1000, effort / 1000)
         # 마지막으로 보낸 그리퍼 명령. 열린 그리퍼도 폭은 넓으므로 '쥐고 있다'는 이것과 폭을 함께 본다 (holding)
         self.grip_closed = not open_
         t0 = time.monotonic()
