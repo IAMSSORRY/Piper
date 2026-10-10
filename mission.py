@@ -310,37 +310,53 @@ class Mission:
         # 닫은 손가락을 내릴 빈 곳: 사과 둘레(중심에서 r + 손가락 반 + 여유)에서 벽·이웃 사과와 안 겹치는 곳 중,
         # 거기서 사과 중심 쪽으로 미는 방향이 '벽에서 멀어지는 방향'에 가장 가까운 곳
         half = nd.get("finger_size_m", 0.016) / 2
-        gap = nd.get("clear_m", 0.004)
+        gap = nd.get("clear_m", 0.004)              # 손가락 ↔ 사과 여유
+        wall_gap = nd.get("wall_gap_m", 0.002)      # 손가락 ↔ 벽 여유 (끄트머리 틈은 좁다)
         d0 = r + half + gap
-        best = None
-        for k in range(0, 360, 10):
-            t = math.radians(k)
-            sx, sy = ax + d0 * math.cos(t), ay + d0 * math.sin(t)
-            if not _inside(sx, sy, walls, center) or any(_seg_dist(sx, sy, *w) < half + gap for w in walls):
-                continue   # 트레이 밖이거나 벽에 너무 가깝다
-            if any(math.hypot(sx - ox, sy - oy) < orr + half + gap for ox, oy, orr in ctx["others"]):
-                continue   # 이웃 사과와 겹친다
-            dx, dy = -math.cos(t), -math.sin(t)          # 빈 곳 → 사과 중심 = 미는 방향
-            score = dx * wx + dy * wy
-            if score > 0.2 and (best is None or score > best[0]):
-                best = (score, sx, sy, dx, dy)
+
+        def find(min_score):
+            best = None
+            for k in range(0, 360, 5):
+                t = math.radians(k)
+                sx, sy = ax + d0 * math.cos(t), ay + d0 * math.sin(t)
+                if not _inside(sx, sy, walls, center) or any(_seg_dist(sx, sy, *w) < half + wall_gap for w in walls):
+                    continue   # 트레이 밖이거나 손가락이 벽에 걸린다
+                if any(math.hypot(sx - ox, sy - oy) < orr + half + gap for ox, oy, orr in ctx["others"]):
+                    continue   # 이웃 사과와 겹친다
+                dx, dy = -math.cos(t), -math.sin(t)          # 빈 곳 → 사과 중심 = 미는 방향
+                score = dx * wx + dy * wy
+                if score >= min_score and (best is None or score > best[0]):
+                    best = (score, sx, sy, dx, dy)
+            return best
+
+        # 1) 사과 뒤쪽(벽 쪽) 끄트머리 틈 — 미는 방향이 '벽에서 멀어지는 방향'과 45° 이내. 사과를 곧게 민다
+        # 2) 그런 틈이 없으면 비스듬히(70° 이내)라도. 예전에는 78° 까지 허용해 스치듯 밀었다
+        best = find(nd.get("push_min_align", 0.7)) or find(0.35)
         if best is None:
-            raise NoPushSpace("사과 둘레에 닫은 손가락을 넣을 빈 곳이 없습니다")
+            raise NoPushSpace("사과 둘레에 닫은 손가락을 넣을 틈이 없습니다")
         _, sx, sy, dx, dy = best
-        push = nd.get("push_m", 0.04) + half + gap                  # 사과에 닿을 때까지 + 미는 거리
+        push = nd.get("push_m", 0.06) + gap                         # 사과에 닿을 때까지 + 미는 거리
         z_top = p["tray_z_m"] + 2 * r                               # 손가락끝이 사과 꼭대기 높이인 플랜지 z
-        z_push = p["tray_z_m"] + nd.get("push_height_ratio", 0.9) * r   # 손가락끝 = 사과 가운데 조금 아래
+        # 손가락끝 = 사과 아래쪽 (가운데보다 낮게 밀어야 사과가 넘어가지 않고 밀린다)
+        z_push = p["tray_z_m"] + nd.get("push_height_ratio", 0.6) * r
         spd = nd.get("speed_pct", 10)
-        log.info("밀기: 사과 (%.3f, %.3f) 옆 빈 곳 (%.3f, %.3f) 에 손가락을 넣어 → 방향 (%.2f, %.2f) %.0fmm",
-                 ax, ay, sx, sy, dx, dy, (push - half - gap) * 1000)
+        log.info("밀기: 사과 (%.3f, %.3f) 끄트머리 틈 (%.3f, %.3f) 에 손가락을 넣어 → 방향 (%.2f, %.2f) %.0fmm (벽 반대쪽과 %.0f°)",
+                 ax, ay, sx, sy, dx, dy, (push - gap) * 1000, math.degrees(math.acos(max(-1.0, min(1.0, best[0])))))
         self.dash.mission("phase", phase="nudge")
         self.r.jaw_yaw = math.atan2(dx, -dy)                        # 손가락이 미는 방향과 직각으로 나란히
         self.r.grip(False)
         self.r.transit_to(sx, sy, self.cfg["motion"]["transit_speed_pct"])
         try:
             self.r.down_to(sx, sy, z_top + 0.03, self.cfg["motion"]["transit_speed_pct"])
-            self.r.down_to(sx, sy, z_push, spd)                          # 빈 곳으로 쑥
-            self.r.down_to(sx + dx * push, sy + dy * push, z_push, spd)  # 수평으로 끝까지 민다
+            self.r.down_to(sx, sy, z_push, spd)                          # 틈으로 쑥 (힘 감지 기본 기준)
+            # 수평 밀기: 사과를 미는 부하는 정상이다 — 기본 기준이면 밀기 시작하자마자 '힘 이상'으로 끊겨
+            # 툭 건드리고 말았다. 미는 동안만 기준을 push_force_scale 배로 (벽처럼 단단한 데 부딪히면 여전히 선다)
+            thr0 = self.r.fm_thr0
+            self.r.fm_thr0 = [v * nd.get("push_force_scale", 3.0) for v in thr0]
+            try:
+                self.r.down_to(sx + dx * push, sy + dy * push, z_push, spd)  # 수평으로 끝까지 민다
+            finally:
+                self.r.fm_thr0 = thr0
         except ForceStop as e:   # 밀다 걸리면 거기서 멈추고 들어 올린다 (미션은 계속)
             log.warning("밀기 중 힘 감지 — 멈추고 올린다: %s", e)
             self.r.hold()
