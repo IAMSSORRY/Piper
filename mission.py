@@ -220,8 +220,7 @@ class Mission:
         self.r.jaw_yaw = None
         g = c["gripper"]
         open_w = float(g["open_width_m"])
-        if ctx:   # 사과 크기를 알면 필요한 만큼만 연다 (지름 + 여유)
-            open_w = min(open_w, 2 * ctx["r"] + float(g.get("open_margin_m", 0.02)))
+        # 집을 때는 그리퍼를 끝까지 편다 (10-10: 지름 + 여유만 열었더니 손가락이 사과를 쳐서 튕겨 못 잡는 일이 많았다)
         if ctx and g.get("auto_jaw", True):
             th, clear = best_jaw_yaw(ax, ay, ctx["r"], open_w, g["finger_width_m"],
                                      ctx["others"], ctx["walls"])
@@ -410,7 +409,9 @@ class Mission:
         spd = self.tuner.speed(p["descend_speed_pct"])
         log.info("== place '%s' 상자 (놓는 높이 %.3fm, 하강 %.0f%%)", grade, self.tuner.release_h, spd)
         self.dash.mission("phase", phase="place")
-        self.r.transit_to(bx, by, self.cfg["motion"]["transit_speed_pct"])
+        # 상자 위까지는 천천히·정확히 (도착 판정도 엄격하게, 선 뒤 흔들림이 멎을 때까지 잠깐) — 내려가는 건 그대로 빠르게
+        self.r.transit_to(bx, by, p.get("transit_speed_pct", 35), final_tol=p.get("arrive_tol_rad", 0.006))
+        time.sleep(p.get("arrive_settle_s", 0.2))
         slow = p.get("slow_zone_m", 0.04)
         z_fast = z_expect + slow + p.get("contact_margin_m", 0.03)   # 여기까지 빠르게
         if self.r.current_pose()[2] > z_fast + 0.005:

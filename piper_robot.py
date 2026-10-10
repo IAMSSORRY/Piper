@@ -476,8 +476,11 @@ class Robot:
             raise MotionTimeout(f"{e} — 현재 ({p[0]:.3f},{p[1]:.3f},{p[2]:.3f}), "
                                 f"남은 거리 {math.dist(p[:3], target) * 1000:.1f}mm{hint}")
 
-    def move_joints(self, joints, speed_pct, timeout=None, tick=None):
-        """관절 각도[rad] 6개로 이동 (MOVE J). 도착까지 블로킹."""
+    def move_joints(self, joints, speed_pct, timeout=None, tick=None, tol=None):
+        """관절 각도[rad] 6개로 이동 (MOVE J). 도착까지 블로킹.
+        tol: 도착 판정 관절 오차(rad)를 더 엄격하게 (상자 위처럼 정확히 서야 할 때). None = joint_tol_rad"""
+        tol_done = self.joint_tol if tol is None else tol
+        tol_near = NEAR_JOINT_RAD if tol is None else 2 * tol
         if len(joints) != 6:
             raise RobotError("관절 각도는 6개여야 합니다")
         for i, (v, (lo, hi)) in enumerate(zip(joints, JOINT_LIMITS)):
@@ -494,12 +497,12 @@ class Robot:
 
         def done():
             cur = self.current_joints()
-            return (max(abs(a - b) for a, b in zip(cur, joints)) <= self.joint_tol
+            return (max(abs(a - b) for a, b in zip(cur, joints)) <= tol_done
                     and int(self._status().motion_status) == 0)
 
         def near():
             cur = self.current_joints()
-            return (max(abs(a - b) for a, b in zip(cur, joints)) <= NEAR_JOINT_RAD
+            return (max(abs(a - b) for a, b in zip(cur, joints)) <= tol_near
                     and int(self._status().motion_status) == 0)
 
         self._run_until(send, done, timeout or self.timeout, "move_joints", near=near,
@@ -728,7 +731,7 @@ class Robot:
         r_far, r_in = float(self.cfg.get("transit_far_r_m", 0.36)), float(self.cfg.get("transit_inner_r_m", 0.28))
         return (x * r_in / r, y * r_in / r) if r > r_far else None
 
-    def transit_to(self, x, y, speed_pct):
+    def transit_to(self, x, y, speed_pct, final_tol=None):
         """이동 높이(손가락끝 transit_tip_z_m)에서 (x, y) 위로. 제자리 상승 → (먼 곳이면 안쪽 경유) → 목표.
         구간마다 처짐·금지 구역을 순기구학으로 점검. 도착까지 블로킹."""
         r = math.hypot(x, y)
@@ -751,8 +754,8 @@ class Robot:
             q_prev = q_s
         log.info("transit_to (%.3f, %.3f) 손가락끝 z %.2f, 경유 %d점, 기울기 %.0f°→%.0f°",
                  x, y, self.transit_tip_z, len(path), t_up, t_goal)
-        for q in path:
-            self.move_joints(q, speed_pct)
+        for k, q in enumerate(path):
+            self.move_joints(q, speed_pct, tol=final_tol if k == len(path) - 1 else None)
 
     def go_home(self, speed_pct=None):
         """대기 자세 복귀: 낮게 있으면 먼저 수직 상승(z_safe_m) → 이동 높이로 home_xy 위.
