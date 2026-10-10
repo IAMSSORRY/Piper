@@ -51,7 +51,7 @@ workspace:
 
 motion:
   transit_speed_pct: 70      # 공중 이동·검사·홈 (빠르게). 21:45 40 → 70
-  approach_speed_pct: 50     # 잡기/놓기 직전 구간 위까지 내려가기
+  approach_speed_pct: 30     # 잡기/놓기 직전 구간 위까지 내려가기. 10-10 50 → 30 (내려가는 힘이 셈)
   move_timeout_s: 15.0       # 동작 하나당 최대 시간. 넘으면 그 자리 정지 후 종료
   pos_tol_m: 0.004           # 도착 판정 거리 오차
   joint_tol_rad: 0.02        # 도착 판정 관절 오차
@@ -72,7 +72,8 @@ pick:
   tray_z_m: 0.132            # 손가락 끝이 트레이 바닥에 닿을 때 플랜지 z (17:55 실측). 아래 높이들은 전부 여기 기준
   grasp_height_m: 0.030      # 바닥 위 손가락 끝 높이 ≈ 사과 반지름 (사과 지름 ~64mm) ★
   approach_height_m: 0.10    # 바닥 위 접근 높이 (사과 높이 64mm + 여유). 여기까지 빠르게, 그다음 천천히
-  descend_speed_pct: 20      # 하강 속도 (적응형 조정 대상)
+  descend_speed_pct: 12      # 하강 속도 (적응형 조정 대상). 10-10 20 → 12 (내려가는 힘이 셈)
+  contact_nm: 0.5            # 잡기 하강 중 관절2·3 부하가 이만큼 바뀌면 닿은 것으로 보고 멈춘다 (놓기와 같은 방식) ★
   lift_speed_pct: 50         # 쥐고 올라가는 속도. 21:45 25 → 50
   retries: 1                 # 못 집었을 때 재시도 횟수
   grasp_offset_m: [-0.010, 0.0]  # 잡는 위치 미세 보정 [x, y] m. +x = Sony 화면 아래, +y = 화면 오른쪽. 19:32 "화면상 살짝 위로" → -1cm ★
@@ -271,16 +272,21 @@ force_monitor:
   slow_speed_max_pct: 30     # 이 속도 이하 동작(잡기·놓기 직전) = 기준 그대로
   fast_scale: 2.5            # 빠른 이동은 기준 × 2.5 (21:56 실측: 70% 이동 정상 편차 최대 1.9 N·m)
 
-# 벽에 붙은 사과 굴리기 — 손가락 여유가 min_clearance_m 보다 작으면, 닫은 손가락으로 사과 윗면의 벽 쪽을
-# 살짝 눌러 가운데로 밀어 굴린 뒤 다시 찍고 집는다 (21:07 결정)
+# 벽에 붙은 사과 밀기 — 손가락 여유가 min_clearance_m 보다 작으면, 사과 둘레 빈 틈(벽 쪽 끄트머리 우선)에
+# 닫은 손가락을 사과 아래쪽 높이까지 넣고 수평으로 밀어 벽에서 떼어 낸 뒤 다시 찍고 집는다 (10-10 새로)
 nudge:
   enabled: true
   min_clearance_m: 0.010
   max_per_apple: 2
-  contact_offset_m: 0.012    # 사과 중심에서 벽 쪽으로 이만큼 떨어진 윗면을 누른다
-  press_m: 0.002             # 누르는 깊이 (꼭대기에서)
-  push_m: 0.035              # 미는 거리 (사과는 약 절반 굴러간다)
-  speed_pct: 10
+  finger_size_m: 0.016       # 닫은 손가락 단면 크기 ★
+  clear_m: 0.004             # 손가락 ↔ 사과 여유 (내릴 때 안 닿게)
+  wall_gap_m: 0.002          # 손가락 ↔ 벽 여유
+  min_align: 0.35            # 미는 방향 ↔ 벽 반대 방향 cos 최소 (0.35 = 70° 이내)
+  push_height_ratio: 0.5     # 미는 높이 = 바닥 + 반지름 × 이 값 (사과 아래쪽)
+  push_m: 0.05               # 닿은 뒤 미는 거리
+  push_force_scale: 2.5      # 미는 동안만 힘 감지 기준 배율
+  back_off_m: 0.01           # 민 뒤 손가락을 뒤로 빼는 거리
+  speed_pct: 15
 
 # 원격 제어 (python3 mission.py --serve) — 프론트/대시보드 서버가 시작·비상정지·해제·멈춤을 보낸다 (control.py)
 control:
