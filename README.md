@@ -107,6 +107,7 @@ SSORRY_TOKEN=<토큰> $PY mission.py --serve      # 0.0.0.0:8765
 | `POST /park` | 쥔 사과를 집은 자리에 되돌리고 팔을 낮춘 뒤 정지 |
 | `POST /resume` | 비상정지 해제 → 멈춘 사과부터 이어서 |
 | `POST /stop` | 지금 사과까지만 하고 멈춤 |
+| `POST /clear` | 칸 비움 `{"grade": "상"}` (생략 = 전체). 미션 중 사람이 칸을 비웠을 때 놓은 자리 기록을 지워 다시 놓게 한다 |
 
 - 헤더 `Authorization: Bearer <SSORRY_TOKEN>`
 - `/estop` 은 팔을 낮추지 않습니다. 위급하지 않을 때는 `/park` 를 씁니다
