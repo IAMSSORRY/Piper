@@ -201,13 +201,23 @@ def best_jaw_yaw(x, y, apple_r, open_w, finger_w, obstacles, walls):
     return best
 
 
-def wall_jaw_yaw(x, y, apple_r, open_w, finger_w, obstacles, walls, near_m, min_clear):
+def wall_jaw_yaw(x, y, apple_r, open_w, finger_w, obstacles, walls, near_m, min_clear, corner_m=None):
     """벽에 붙은 사과의 집게 방향 — 벽을 보고 정한다. (방향 rad, 여유 m, 설명) 또는 None(가까운 벽 없음 / 안 됨).
 
     - 벽 하나에 붙음(가로벽 / 세로벽): 집게가 벽과 나란히 닫히게 → 손가락이 사과 양옆(벽을 따라)으로 내려앉는다.
       가로벽이면 손가락이 세로로 서고, 세로벽이면 가로로 선다. 벽과 사과 사이에 손가락을 넣지 않는다
     - 모서리(두 벽)거나, 벽과 나란히는 이웃 사과에 걸리면: 대각선(벽에서 ±45°) 중 자리가 있는 쪽
     - 어느 것도 min_clear 이상 여유가 없으면 None (기존처럼 굴리기 / 최대 여유 방향)"""
+    def clr(th):
+        return jaw_clearance(th, x, y, open_w, finger_w, obstacles, walls)
+
+    # 모서리 먼저: 트레이 꼭짓점이 가까우면(사과가 두 벽에 다 붙지 않아 보여도) 꼭짓점을 가리키는 대각선으로 잡는다.
+    # 벽 선은 사진에서 테두리 안쪽으로 짐작한 것이라 몇 cm 틀릴 수 있다 — 벽까지 거리보다 꼭짓점까지 거리가 확실하다
+    if corner_m is not None and walls:
+        vx, vy = min(((w[0], w[1]) for w in walls), key=lambda v: math.hypot(v[0] - x, v[1] - y))
+        if math.hypot(vx - x, vy - y) < apple_r * math.sqrt(2) + corner_m:
+            th = math.atan2(vy - y, vx - x) % math.pi
+            return th, clr(th), "대각선 (모서리)"
     near = [w for w in walls if _seg_dist(x, y, *w) < apple_r + near_m]
     if not near:
         return None
@@ -217,9 +227,6 @@ def wall_jaw_yaw(x, y, apple_r, open_w, finger_w, obstacles, walls, near_m, min_
         if all(abs((a - b + math.pi / 2) % math.pi - math.pi / 2) > math.radians(20) for b in dirs):
             dirs.append(a)
     base = dirs[0]                           # 가장 가까운 벽 방향
-
-    def clr(th):
-        return jaw_clearance(th, x, y, open_w, finger_w, obstacles, walls)
 
     if len(dirs) > 1:
         # 모서리: 집게를 모서리를 가리키는 대각선으로 — 한 손가락은 모서리 쪽 삼각형 틈에, 다른 손가락은 트레이 안쪽에.
@@ -270,7 +277,8 @@ class Mission:
         if ctx and g.get("auto_jaw", True):
             # 벽에 붙었으면 벽을 보고 돌려 잡는다: 벽과 나란히(가로벽 → 세로, 세로벽 → 가로), 모서리·애매하면 대각선
             wj = wall_jaw_yaw(ax, ay, ctx["r"], open_w, g["finger_width_m"], ctx["others"], ctx["walls"],
-                              float(g.get("wall_near_m", 0.015)), float(g.get("wall_min_clear_m", 0.003)))
+                              float(g.get("wall_near_m", 0.015)), float(g.get("wall_min_clear_m", 0.003)),
+                              float(g.get("corner_near_m", 0.04)))
             if wj and "모서리" in wj[2]:
                 # 모서리: 사과 지름 + 조금만 벌려 모서리 쪽 손가락이 틈에 들어가게. 내려가다 닿으면 거기서 멈추고 잡는다
                 open_w = min(open_w, 2 * ctx["r"] + float(g.get("corner_open_margin_m", 0.006)))
