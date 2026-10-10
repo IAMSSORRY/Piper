@@ -227,10 +227,9 @@ class Mission:
                                      ctx["others"], ctx["walls"])
             nd = c.get("nudge", {})
             if nd.get("enabled", True) and clear < nd.get("min_clearance_m", 0.010) and self._nudges < nd.get("max_per_apple", 2):
-                log.warning("손가락 여유 %.0fmm — 벽에 붙은 사과. 틈에 손가락을 넣어 민 뒤 다시 찍고 집는다", clear * 1000)
-                self._nudges += 1
-                if self._nudge(ax, ay, ctx):
-                    raise NeedRedetect()
+                log.warning("손가락 여유 %.0fmm — 벽에 붙은 사과. 가운데로 살짝 굴린 뒤 다시 집는다", clear * 1000)
+                self._nudge(ax, ay, ctx)
+                raise NeedRedetect()
             self.r.jaw_yaw = th
             (log.warning if clear < 0.005 else log.info)(
                 "집게 방향 %.0f° (손가락 여유 %.0fmm%s)", math.degrees(th), clear * 1000,
@@ -243,10 +242,7 @@ class Mission:
         self.r.transit_to(x, y, c["motion"]["transit_speed_pct"])
         self.r.grip(True, width=open_w)
         self.r.down_to(x, y, z_app, c["motion"]["approach_speed_pct"])
-        # 잡기 직전만 느리게, 닿으면(사과 윗면·트레이) 거기서 멈춘다 — 끝까지 밀어붙여 누르지 않게
-        how, _ = self.r.guarded_down(x, y, z_grasp, self.tuner.speed(p["descend_speed_pct"]), p.get("contact_nm", 0.5))
-        if how == "contact":
-            log.warning("잡기 하강 중 닿음 — 그 높이에서 집는다")
+        self.r.down_to(x, y, z_grasp, self.tuner.speed(p["descend_speed_pct"]))   # 잡기 직전만 느리게
         w = self.r.grip(False)
         min_w = c["gripper"]["min_grasp_width_m"]
         ok = w >= min_w
@@ -260,85 +256,45 @@ class Mission:
         return ok
 
     def _nudge(self, ax, ay, ctx):
-        """벽에 붙은 사과를 벽에서 떼어 낸다 (위에서 누르지 않는다).
-
-        1) 사과 둘레에서 닫은 손가락이 들어갈 빈 틈(벽·이웃 사과와 안 겹치는 곳)을 찾는다.
-           그 틈에서 사과 중심으로 미는 방향이 '벽에서 멀어지는 방향'에 가까울수록 좋다 (벽 쪽 끄트머리 틈)
-        2) 틈 위에서 손가락을 사과 아래쪽 높이(바닥 + push_height_ratio × r)까지 쑥 내린다
-        3) 사과 중심 쪽으로 수평으로 push_m 만큼 민다. 미는 부하는 정상이라 이 동안만 힘 기준을 push_force_scale 배로
-           (벽처럼 단단한 데 부딪히면 여전히 선다)
-        4) 손가락을 살짝 뒤로 빼고 수직으로 올린다 (사과를 끌고 올라가지 않게)
-        틈이 없으면 False (밀지 않고 그대로 집는다)."""
+        """벽에 붙은 사과를 가운데 쪽으로 굴린다: 닫은 손가락으로 사과 윗면의 벽 쪽을 살짝 누르고 가운데로 민다."""
+        self._nudges += 1
         nd, p = self.cfg.get("nudge", {}), self.cfg["pick"]
-        r, walls, others = ctx["r"], ctx["walls"], ctx["others"]
-        cx, cy = ctx["center"]
+        r = ctx["r"]
         # 벽에서 멀어지는 방향 = 가까운 벽들의 안쪽 법선 합 (없으면 트레이 가운데 쪽)
-        wx = wy = 0.0
-        for x1, y1, x2, y2 in walls:
+        cx, cy = ctx["center"]
+        dx = dy = 0.0
+        for x1, y1, x2, y2 in ctx["walls"]:
             if _seg_dist(ax, ay, x1, y1, x2, y2) < r + 0.03:
                 nx, ny = -(y2 - y1), (x2 - x1)
                 n = math.hypot(nx, ny) or 1.0
                 nx, ny = nx / n, ny / n
                 if (cx - x1) * nx + (cy - y1) * ny < 0:   # 안쪽을 향하게
                     nx, ny = -nx, -ny
-                wx, wy = wx + nx, wy + ny
-        if math.hypot(wx, wy) < 1e-6:
-            wx, wy = cx - ax, cy - ay
-        n = math.hypot(wx, wy) or 1.0
-        wx, wy = wx / n, wy / n
-
-        half = nd.get("finger_size_m", 0.016) / 2        # 닫은 손가락 단면 반 크기
-        gap = nd.get("clear_m", 0.004)                   # 손가락 ↔ 사과 여유 (내릴 때 안 닿게)
-        wall_gap = nd.get("wall_gap_m", 0.002)           # 손가락 ↔ 벽 여유 (끄트머리 틈은 좁다)
-        d0 = r + half + gap
-        best = None
-        for k in range(0, 360, 5):
-            t = math.radians(k)
-            sx, sy = ax + d0 * math.cos(t), ay + d0 * math.sin(t)
-            if min(_seg_dist(sx, sy, *w) for w in walls) < half + wall_gap:
-                continue   # 손가락이 벽에 걸린다
-            if any(((x2 - x1) * (sy - y1) - (y2 - y1) * (sx - x1)) * ((x2 - x1) * (cy - y1) - (y2 - y1) * (cx - x1)) < 0
-                   for x1, y1, x2, y2 in walls):
-                continue   # 벽 너머 (트레이 밖)
-            if any(math.hypot(sx - ox, sy - oy) < orr + half + gap for ox, oy, orr in others):
-                continue   # 이웃 사과에 걸린다
-            dx, dy = -math.cos(t), -math.sin(t)          # 틈 → 사과 중심 = 미는 방향
-            score = dx * wx + dy * wy
-            if score >= nd.get("min_align", 0.35) and (best is None or score > best[0]):
-                best = (score, sx, sy, dx, dy)
-        if best is None:
-            log.warning("밀기: 사과 둘레에 손가락을 넣을 틈이 없음 — 밀지 않고 집는다")
-            return False
-        score, sx, sy, dx, dy = best
-        push = gap + nd.get("push_m", 0.05)
-        z_push = p["tray_z_m"] + nd.get("push_height_ratio", 0.5) * r   # 손가락끝 = 사과 아래쪽 (넘기지 않고 밀리게)
-        z_above = p["tray_z_m"] + 2 * r + 0.03
-        spd = nd.get("speed_pct", 15)
-        log.info("밀기: 사과 (%.3f, %.3f) 틈 (%.3f, %.3f) → 방향 (%.2f, %.2f) %.0fmm, 벽 반대쪽과 %.0f°",
-                 ax, ay, sx, sy, dx, dy, push * 1000, math.degrees(math.acos(max(-1.0, min(1.0, score)))))
+                dx, dy = dx + nx, dy + ny
+        if math.hypot(dx, dy) < 1e-6:
+            dx, dy = cx - ax, cy - ay
+        n = math.hypot(dx, dy)
+        dx, dy = dx / n, dy / n
+        off, push = nd.get("contact_offset_m", 0.012), nd.get("push_m", 0.035)
+        px, py = ax - dx * off, ay - dy * off                       # 윗면의 벽 쪽
+        z_top = p["tray_z_m"] + 2 * r                               # 손가락끝이 사과 꼭대기에 닿는 플랜지 z
+        z_touch = z_top - nd.get("press_m", 0.002)
+        spd = nd.get("speed_pct", 10)
+        log.info("굴리기: 사과 (%.3f, %.3f) → 방향 (%.2f, %.2f) %.0fmm", ax, ay, dx, dy, push * 1000)
         self.dash.mission("phase", phase="nudge")
-        self.r.jaw_yaw = math.atan2(dx, -dy)                        # 손가락 넓은 면이 사과를 향하게
+        self.r.jaw_yaw = math.atan2(dx, -dy)                        # 손가락이 미는 방향과 직각으로 나란히
         self.r.grip(False)
-        self.r.transit_to(sx, sy, self.cfg["motion"]["transit_speed_pct"])
-        thr0 = self.r.fm_thr0
+        self.r.transit_to(px, py, self.cfg["motion"]["transit_speed_pct"])
         try:
-            self.r.down_to(sx, sy, z_above, self.cfg["motion"]["approach_speed_pct"])
-            self.r.down_to(sx, sy, z_push, spd)                     # 틈으로 쑥
-            self.r.fm_thr0 = [v * nd.get("push_force_scale", 2.5) for v in thr0]
-            self.r.down_to(sx + dx * push, sy + dy * push, z_push, spd)   # 수평으로 민다
-            peak = max(self.r.fm_peak) if getattr(self.r, "fm_peak", None) else 0.0
-            log.info("밀기 끝: 최대 부하 편차 %.2f N·m%s", peak, " — 사과에 거의 안 닿은 것 같음" if peak < 0.15 else "")
-        except ForceStop as e:   # 단단한 데(벽·트레이) 걸리면 거기서 멈추고 올린다 (미션은 계속)
-            log.warning("밀기 중 힘 감지 — 멈추고 올린다: %s", e)
+            self.r.down_to(px, py, z_top + 0.03, self.cfg["motion"]["transit_speed_pct"])
+            self.r.down_to(px, py, z_touch, spd)
+            self.r.down_to(px + dx * push, py + dy * push, z_touch, spd)
+        except ForceStop as e:   # 굴리다 걸리면 거기서 멈추고 들어 올린다 (미션은 계속)
+            log.warning("굴리기 중 힘 감지 — 멈추고 올린다: %s", e)
             self.r.hold()
-        finally:
-            self.r.fm_thr0 = thr0
         x, y = self.r.current_pose()[:2]
-        back = nd.get("back_off_m", 0.01)
-        self.r.down_to(x - dx * back, y - dy * back, z_push, spd)   # 사과에서 손가락을 떼고
-        self.r.down_to(x - dx * back, y - dy * back, z_above, self.cfg["motion"]["approach_speed_pct"])
+        self.r.down_to(x, y, z_top + 0.04, spd)
         self.r.jaw_yaw = None
-        return True
 
     def inspect(self):
         """검사: 'rotate' 면 사과를 들어 위 카메라에 비추고 손목(joint6)을 돌려 가며 멍을 본다. 등급 반환."""
@@ -832,8 +788,6 @@ def main():
         if not sim:
             from vision import open_roll_watcher
             roll = open_roll_watcher(cfg)
-        from live_detect import start_live_detections
-        live = start_live_detections(signals, cfg, dash)   # 대시보드 top 영상 위 실시간 사과 박스
         cfg["mission"]["apple_count"] = resolve_apple_count(cfg, args.apples)
         if args.serve:
             from control import Controller, serve
@@ -845,8 +799,6 @@ def main():
             try:
                 serve(ctl, cc.get("host", "0.0.0.0"), args.port or cc.get("port", 8765), tok)
             finally:
-                if live:
-                    live.stop()
                 dash.flush()
                 if roll:
                     roll.close()
@@ -866,8 +818,6 @@ def main():
             dash.mission("estop", reason=f"정지: {e}")
             raise
         finally:
-            if live:
-                live.stop()
             dash.flush()
             if roll:
                 roll.close()
