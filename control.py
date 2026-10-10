@@ -8,13 +8,12 @@
   POST /park                    정리 후 정지: 그 자리 정지 → 쥔 사과를 집은 자리에 되돌림 → 팔을 낮게 → 실제 비상정지
                                 (진행 중 /estop 을 누르면 정리를 버리고 즉시 비상정지)
   POST /resume                  비상정지(또는 오류 정지) 해제 → 멈춘 사과부터 이어서
-  POST /stop                    정지: 그 자리에 바로 선다 (모터는 켠 채, 비상정지 아님). /resume 으로 멈춘 사과부터 이어서
+  POST /stop                    지금 사과까지만 하고 멈춤
   POST /clear  {"grade": "상"}  사람이 칸을 비웠다 — 그 칸(생략하면 전체)의 '이번 미션에 놓은 자리' 기록을 지운다.
                                 기록은 팔에 가려 사진에 안 보이는 사과 위에 겹쳐 놓지 않으려고 미션 내내 남겨 두므로,
                                 미션 중에 칸을 비우면 이걸 불러야 그 칸에 다시 놓는다
 
-state: idle(대기) / running(실행 중) / stopped(/stop 정지, 모터 켜짐) / stopping(/park 정리 중) / estopped(비상정지) /
-       error(오류로 그 자리 정지) / done(완료)
+state: idle(대기) / running(실행 중) / stopping(/park 정리 중) / estopped(비상정지) / error(오류로 그 자리 정지) / done(완료)
 
 ⚠ 비상정지는 '즉시 그 자리'다. 예전에는 /estop 이 사과 되돌리기·팔 내리기를 먼저 했고(최대 ~20초),
   그 사이 미션 스레드가 정지 요청을 '사과 건너뜀'으로 삼켜 계속 돌면서 두 스레드가 팔을 같이 움직였다 (10-09 SIM 재현).
@@ -56,9 +55,6 @@ class Controller:
         if state in ("estopped", "error"):
             # 웹(대시보드 서버)은 'estop' 이벤트로 비상정지 화면을 띄운다 — 어떤 이유로 멈췄든 보낸다
             self.dash.mission("estop", reason=error or "정지")
-        elif state == "stopped":
-            # 정지(일시 멈춤) — 비상정지 아님. 웹은 'pause' 이벤트로 '정지' 표시 (서버 stalled 감시에서도 빠진다)
-            self.dash.mission("pause", reason=error or "정지")
         elif state == "running" and self.mission is not None and self.mission.next_i:
             # 이어하기: 'apple' 이벤트가 와야 웹이 비상정지 → 진행 중으로 돌아간다
             self.dash.mission("apple", index=self.mission.next_i + 1,
@@ -185,14 +181,6 @@ class Controller:
                     return False, "이전 미션이 아직 끝나지 않음 — 잠시 뒤 다시"
             self.r.clear_soft_stop()
             self._estop_now.clear()
-            if self.state == "stopped" and not self.r._estopped.is_set():
-                # /stop 으로 선 것 — 모터가 켜져 있으니 비상정지 해제·재연결 없이 바로 이어 간다
-                if self.mission is None:
-                    self._set("idle")
-                    return True, "정지 해제 — 대기 (/start 로 시작)"
-                self.mission.stop_requested = False
-                self._launch(resume=True)
-                return True, f"사과 {self.mission.next_i + 1}번째부터 이어서"
             if self.state == "estopped" or self.r._estopped.is_set():
                 log.warning("비상정지 해제 — 해제 순간 모터 전원이 잠깐 빠져 팔이 처질 수 있다")
                 self.r.resume()          # SDK EmergencyStop(0x02)
@@ -211,20 +199,9 @@ class Controller:
             return True, f"사과 {self.mission.next_i + 1}번째부터 이어서"
 
     def stop(self):
-        """정지: 하던 동작을 그 자리에서 바로 멈춘다 (지금 관절 자세 유지, 모터 켜짐 — 비상정지 아님).
-        /resume 으로 멈춘 사과부터 이어 간다 (쥐고 있던 사과는 이어 가기 전에 트레이에 되돌린다)."""
-        if self.r._estopped.is_set():
-            return False, "비상정지 상태입니다 — /resume 으로 해제하세요"
-        if self.state != "running":
-            return False, f"실행 중이 아닙니다 ({self.state})"
-        if not self._stop_mission_thread(timeout=3.0):
-            # 미션 스레드가 안 멈췄다 — 두 동작이 섞이게 두지 않는다
-            log.error("정지: 미션이 3초 안에 안 멈춤 → 비상정지")
-            self.estop()
-            return True, "미션이 안 멈춰 비상정지했습니다"
-        self.r.hold()                    # 한 번 더 '여기서 멈춤' (모터 켠 채)
-        self._set("stopped", "정지")
-        return True, "정지 — /resume 으로 이어서"
+        if self.mission is not None:
+            self.mission.stop_requested = True
+        return True, "지금 사과까지만 하고 멈춤"
 
     def clear(self, grade=None):
         """칸 비움: 그 칸(None 이면 전체)의 놓은 자리 기록(used_slots)과 놓은 개수(placed)를 지운다.

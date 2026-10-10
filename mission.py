@@ -165,10 +165,6 @@ class CompartmentFull(RobotError):
     """놓을 칸에 빈 자리가 없다 — 사과를 집은 자리에 되돌리고 다음 사과로."""
 
 
-class NoPushSpace(RobotError):
-    """밀기: 사과 둘레에 닫은 손가락을 넣을 빈 곳이 없다."""
-
-
 class NeedRedetect(Exception):
     """사과를 굴려서 옮겼다 — 다시 찍고 다시 집는다."""
 
@@ -177,16 +173,6 @@ def _seg_dist(px, py, x1, y1, x2, y2):
     dx, dy = x2 - x1, y2 - y1
     t = max(0.0, min(1.0, ((px - x1) * dx + (py - y1) * dy) / (dx * dx + dy * dy or 1e-12)))
     return math.hypot(px - (x1 + t * dx), py - (y1 + t * dy))
-
-
-def _inside(px, py, walls, center):
-    """점이 벽 선분들로 둘러싼 트레이 안쪽인가 — 각 벽에 대해 가운데와 같은 쪽에 있어야 한다."""
-    cx, cy = center
-    for x1, y1, x2, y2 in walls:
-        side = lambda x, y: (x2 - x1) * (y - y1) - (y2 - y1) * (x - x1)
-        if side(px, py) * side(cx, cy) < 0:
-            return False
-    return True
 
 
 def best_jaw_yaw(x, y, apple_r, open_w, finger_w, obstacles, walls):
@@ -240,17 +226,10 @@ class Mission:
             th, clear = best_jaw_yaw(ax, ay, ctx["r"], open_w, g["finger_width_m"],
                                      ctx["others"], ctx["walls"])
             nd = c.get("nudge", {})
-            # 1) 그리퍼를 돌려(가로·세로 포함 0~180°) 손가락 여유가 가장 큰 방향으로 잡을 수 있으면 그대로 잡는다
-            # 2) 안 되면 사과 옆 빈 곳에 닫은 손가락을 넣고 가운데로 민 뒤 다시 찍는다
-            # 3) 밀 빈 곳도 없으면 여유가 가장 큰 방향으로 그냥 잡아 본다 (닿으면 _loop 가 올리고 다시 시도)
             if nd.get("enabled", True) and clear < nd.get("min_clearance_m", 0.010) and self._nudges < nd.get("max_per_apple", 2):
-                log.warning("손가락 여유 %.0fmm (집게 %.0f°) — 벽에 붙은 사과. 옆 빈 곳에서 밀어 본다", clear * 1000, math.degrees(th))
-                try:
-                    self._nudge(ax, ay, ctx)
-                    raise NeedRedetect()
-                except NoPushSpace as e:
-                    log.warning("%s → 여유가 가장 큰 방향(%.0f°)으로 그냥 집어 본다", e, math.degrees(th))
-                    self._nudges = nd.get("max_per_apple", 2)
+                log.warning("손가락 여유 %.0fmm — 벽에 붙은 사과. 가운데로 살짝 굴린 뒤 다시 집는다", clear * 1000)
+                self._nudge(ax, ay, ctx)
+                raise NeedRedetect()
             self.r.jaw_yaw = th
             (log.warning if clear < 0.005 else log.info)(
                 "집게 방향 %.0f° (손가락 여유 %.0fmm%s)", math.degrees(th), clear * 1000,
@@ -264,128 +243,58 @@ class Mission:
         self.r.grip(True, width=open_w)
         self.r.down_to(x, y, z_app, c["motion"]["approach_speed_pct"])
         self.r.down_to(x, y, z_grasp, self.tuner.speed(p["descend_speed_pct"]))   # 잡기 직전만 느리게
-        # 닫기 시작할 때부터 이 자리를 기록 — 닫는 중·들어 올리는 중에 멈추거나 닿아도 여기에 되돌린다
-        # (예전에는 다 올라온 뒤에 기록해서 그 사이에 멈추면 트레이 가운데로 가져갔다). 못 집으면 지운다
-        self.last_pick = (x, y, self.r.jaw_yaw)
         w = self.r.grip(False)
         min_w = c["gripper"]["min_grasp_width_m"]
         ok = w >= min_w
-        if not ok:
-            self.last_pick = None
         self.r.down_to(x, y, z_lift, p["lift_speed_pct"])
         if ok and self.r.gripper_width() < min_w:
             log.warning("상승 중 사과를 놓쳤습니다")
             ok = False
-            self.last_pick = None
+        self.last_pick = (x, y, self.r.jaw_yaw) if ok else None   # 비상정지 때 이 자리에 되돌려 놓는다
         log.info("파지 %s (폭 %.1fmm)", "성공" if ok else "실패", w * 1000)
         self.dash.mission("pick", ok=bool(ok), attempt=getattr(self, "_attempt", 0), width_mm=round(w * 1000, 1))
         return ok
 
     def _nudge(self, ax, ay, ctx):
-        """벽에 붙은 사과를 가운데 쪽으로 민다: 사과를 위에서 치지 않는다 — 사과 둘레의 빈 곳에 닫은 손가락을
-        쑥 내려(사과 가운데 높이) 수평으로 밀어 사과를 벽에서 떼어 낸다. 빈 곳이 없으면 NoPushSpace."""
+        """벽에 붙은 사과를 가운데 쪽으로 굴린다: 닫은 손가락으로 사과 윗면의 벽 쪽을 살짝 누르고 가운데로 민다."""
         self._nudges += 1
         nd, p = self.cfg.get("nudge", {}), self.cfg["pick"]
         r = ctx["r"]
-        center = ctx.get("center")
-        walls = ctx["walls"]
-        if center is None:   # 트레이 가운데를 모르면 벽 선분들의 중점 평균
-            pts = [(x1, y1) for x1, y1, _, _ in walls]
-            center = (sum(x for x, _ in pts) / len(pts), sum(y for _, y in pts) / len(pts))
-        cx, cy = center
         # 벽에서 멀어지는 방향 = 가까운 벽들의 안쪽 법선 합 (없으면 트레이 가운데 쪽)
-        wx = wy = 0.0
-        for x1, y1, x2, y2 in walls:
+        cx, cy = ctx["center"]
+        dx = dy = 0.0
+        for x1, y1, x2, y2 in ctx["walls"]:
             if _seg_dist(ax, ay, x1, y1, x2, y2) < r + 0.03:
                 nx, ny = -(y2 - y1), (x2 - x1)
                 n = math.hypot(nx, ny) or 1.0
                 nx, ny = nx / n, ny / n
                 if (cx - x1) * nx + (cy - y1) * ny < 0:   # 안쪽을 향하게
                     nx, ny = -nx, -ny
-                wx, wy = wx + nx, wy + ny
-        if math.hypot(wx, wy) < 1e-6:
-            wx, wy = cx - ax, cy - ay
-        n = math.hypot(wx, wy) or 1.0
-        wx, wy = wx / n, wy / n
-        # 닫은 손가락을 내릴 빈 곳: 사과 둘레(중심에서 r + 손가락 반 + 여유)에서 벽·이웃 사과와 안 겹치는 곳 중,
-        # 거기서 사과 중심 쪽으로 미는 방향이 '벽에서 멀어지는 방향'에 가장 가까운 곳
-        half = nd.get("finger_size_m", 0.016) / 2
-        gap = nd.get("clear_m", 0.004)              # 손가락 ↔ 사과 여유
-        wall_gap = nd.get("wall_gap_m", 0.002)      # 손가락 ↔ 벽 여유 (끄트머리 틈은 좁다)
-        d0 = r + half + gap
-
-        def find(min_score):
-            best = None
-            for k in range(0, 360, 5):
-                t = math.radians(k)
-                sx, sy = ax + d0 * math.cos(t), ay + d0 * math.sin(t)
-                if not _inside(sx, sy, walls, center) or any(_seg_dist(sx, sy, *w) < half + wall_gap for w in walls):
-                    continue   # 트레이 밖이거나 손가락이 벽에 걸린다
-                if any(math.hypot(sx - ox, sy - oy) < orr + half + gap for ox, oy, orr in ctx["others"]):
-                    continue   # 이웃 사과와 겹친다
-                dx, dy = -math.cos(t), -math.sin(t)          # 빈 곳 → 사과 중심 = 미는 방향
-                score = dx * wx + dy * wy
-                if score >= min_score and (best is None or score > best[0]):
-                    best = (score, sx, sy, dx, dy)
-            return best
-
-        # 1) 사과 뒤쪽(벽 쪽) 끄트머리 틈 — 미는 방향이 '벽에서 멀어지는 방향'과 45° 이내. 사과를 곧게 민다
-        # 2) 그런 틈이 없으면 비스듬히(70° 이내)라도. 예전에는 78° 까지 허용해 스치듯 밀었다
-        best = find(nd.get("push_min_align", 0.7)) or find(0.35)
-        if best is None:
-            raise NoPushSpace("사과 둘레에 닫은 손가락을 넣을 틈이 없습니다")
-        _, sx, sy, dx, dy = best
-        push = nd.get("push_m", 0.06) + gap                         # 사과에 닿을 때까지 + 미는 거리
-        z_top = p["tray_z_m"] + 2 * r                               # 손가락끝이 사과 꼭대기 높이인 플랜지 z
-        # 손가락끝 = 사과 아래쪽 (가운데보다 낮게 밀어야 사과가 넘어가지 않고 밀린다)
-        z_push = p["tray_z_m"] + nd.get("push_height_ratio", 0.6) * r
+                dx, dy = dx + nx, dy + ny
+        if math.hypot(dx, dy) < 1e-6:
+            dx, dy = cx - ax, cy - ay
+        n = math.hypot(dx, dy)
+        dx, dy = dx / n, dy / n
+        off, push = nd.get("contact_offset_m", 0.012), nd.get("push_m", 0.035)
+        px, py = ax - dx * off, ay - dy * off                       # 윗면의 벽 쪽
+        z_top = p["tray_z_m"] + 2 * r                               # 손가락끝이 사과 꼭대기에 닿는 플랜지 z
+        z_touch = z_top - nd.get("press_m", 0.002)
         spd = nd.get("speed_pct", 10)
-        log.info("밀기: 사과 (%.3f, %.3f) 끄트머리 틈 (%.3f, %.3f) 에 손가락을 넣어 → 방향 (%.2f, %.2f) %.0fmm (벽 반대쪽과 %.0f°)",
-                 ax, ay, sx, sy, dx, dy, (push - gap) * 1000, math.degrees(math.acos(max(-1.0, min(1.0, best[0])))))
+        log.info("굴리기: 사과 (%.3f, %.3f) → 방향 (%.2f, %.2f) %.0fmm", ax, ay, dx, dy, push * 1000)
         self.dash.mission("phase", phase="nudge")
         self.r.jaw_yaw = math.atan2(dx, -dy)                        # 손가락이 미는 방향과 직각으로 나란히
         self.r.grip(False)
-        self.r.transit_to(sx, sy, self.cfg["motion"]["transit_speed_pct"])
+        self.r.transit_to(px, py, self.cfg["motion"]["transit_speed_pct"])
         try:
-            self.r.down_to(sx, sy, z_top + 0.03, self.cfg["motion"]["transit_speed_pct"])
-            self.r.down_to(sx, sy, z_push, spd)                          # 틈으로 쑥 (힘 감지 기본 기준)
-            # 수평 밀기: 사과를 미는 부하는 정상이다 — 기본 기준이면 밀기 시작하자마자 '힘 이상'으로 끊겨
-            # 툭 건드리고 말았다. 미는 동안만 기준을 push_force_scale 배로 (벽처럼 단단한 데 부딪히면 여전히 선다)
-            thr0 = self.r.fm_thr0
-            self.r.fm_thr0 = [v * nd.get("push_force_scale", 3.0) for v in thr0]
-            try:
-                self.r.down_to(sx + dx * push, sy + dy * push, z_push, spd)  # 수평으로 끝까지 민다
-            finally:
-                self.r.fm_thr0 = thr0
-        except ForceStop as e:   # 밀다 걸리면 거기서 멈추고 들어 올린다 (미션은 계속)
-            log.warning("밀기 중 힘 감지 — 멈추고 올린다: %s", e)
+            self.r.down_to(px, py, z_top + 0.03, self.cfg["motion"]["transit_speed_pct"])
+            self.r.down_to(px, py, z_touch, spd)
+            self.r.down_to(px + dx * push, py + dy * push, z_touch, spd)
+        except ForceStop as e:   # 굴리다 걸리면 거기서 멈추고 들어 올린다 (미션은 계속)
+            log.warning("굴리기 중 힘 감지 — 멈추고 올린다: %s", e)
             self.r.hold()
         x, y = self.r.current_pose()[:2]
-        self._lift_free(x, y, z_top + 0.04, spd)
+        self.r.down_to(x, y, z_top + 0.04, spd)
         self.r.jaw_yaw = None
-
-    def _lift_free(self, x, y, z, spd):
-        """닿은 뒤 위로 빠지기: 누르던 힘이 풀리는 것도 부하 변화라 힘 감지를 끄고 올린다 (위로만 가니 안전)."""
-        fm, self.r.fm_on = self.r.fm_on, False
-        try:
-            self.r.down_to(x, y, z, spd)
-        finally:
-            self.r.fm_on = fm
-
-    def _recover_collision(self, e):
-        """집다가 벽·사과에 닿음(ForceStop): 비상정지하지 않는다 — 그 자리에서 수직으로 올리고,
-        사과를 쥐고 있으면 집은 자리에 되돌린 뒤 홈으로. 그다음 _loop 가 다시 찍어 다시 시도한다."""
-        log.warning("집다가 닿음 — 비상정지 대신 위로 빼고 원위치 후 다시 시도: %s", e)
-        self.dash.mission("collision", reason=str(e))
-        p = self.cfg["pick"]
-        x, y, z = self.r.current_pose()[:3]
-        self._lift_free(x, y, max(z, self.r.lift_z(x, y)), p["lift_speed_pct"])
-        if self.r.holding(self.cfg["gripper"]["min_grasp_width_m"]):
-            self.return_held(self.cfg["motion"]["transit_speed_pct"], "닿음")
-        else:
-            self.r.grip(True)
-        self.r.jaw_yaw = None
-        self.r.go_home()
 
     def inspect(self):
         """검사: 'rotate' 면 사과를 들어 위 카메라에 비추고 손목(joint6)을 돌려 가며 멍을 본다. 등급 반환."""
@@ -643,15 +552,7 @@ class Mission:
                     if xy is None:
                         break
                     continue
-                except ForceStop as e:          # 벽·사과에 닿음 → 비상정지 대신 원위치 후 다시 시도 (시도 횟수로 센다)
-                    self._recover_collision(e)
-                    attempt += 1
-                    if attempt < 1 + retries:
-                        xy = self.sig.apple_xy(i) or xy
-                        if xy is None:
-                            break
-                    continue
-                except (RobotFault, MotionTimeout, SoftStop):
+                except (RobotFault, MotionTimeout, ForceStop, SoftStop):
                     raise   # 정지 요청·고장은 '이 사과 건너뜀'이 아니다 — 미션을 멈춘다
                 except RobotError as e:   # 관절 해 없음·작업영역 밖 → 이 사과만 건너뛴다
                     log.error("사과 %d 건너뜀: %s", i + 1, e)

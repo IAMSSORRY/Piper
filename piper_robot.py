@@ -265,14 +265,11 @@ class Robot:
         if self.arm is None or self._estopped.is_set():
             return False
         try:
-            # 지금 관절 각도를 그대로 목표로 (MOVE_J). 말단 자세(MOVE_P)를 보내면 펌웨어가 관절 해를 다시 풀며
-            # 손목(joint6)을 크게 돌릴 수 있다(21:33 실측 170°) — '그 자리 정지'가 큰 동작이 되지 않게
-            q = [rad2sdk(v) for v in self.current_joints()]
+            x, y, z, rx, ry, rz = self.current_pose()
             for _ in range(3):
-                self.arm.MotionCtrl_2(CTRL_CAN, MOVE_J, 10, 0x00)
-                self.arm.JointCtrl(*q)
+                self.arm.MotionCtrl_2(CTRL_CAN, MOVE_P, 10, 0x00)
+                self.arm.EndPoseCtrl(m2sdk(x), m2sdk(y), m2sdk(z), rad2sdk(rx), rad2sdk(ry), rad2sdk(rz))
                 time.sleep(0.02)
-            x, y, z = self.current_pose()[:3]
             log.warning("현재 위치 정지 (%.3f, %.3f, %.3f)", x, y, z)
             return True
         except Exception as e:
