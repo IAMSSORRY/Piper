@@ -175,28 +175,61 @@ def _seg_dist(px, py, x1, y1, x2, y2):
     return math.hypot(px - (x1 + t * dx), py - (y1 + t * dy))
 
 
+def jaw_clearance(th, x, y, open_w, finger_w, obstacles, walls):
+    """집게가 th(rad) 방향으로 닫힐 때 두 손가락이 내려앉을 자리의 여유(m). 음수 = 벽/이웃 사과와 겹침."""
+    d = open_w / 2 + finger_w / 2            # 손가락 중심까지 거리
+    ux, uy = math.cos(th), math.sin(th)
+    clear = 1.0
+    for sgn in (1, -1):
+        fx, fy = x + sgn * d * ux, y + sgn * d * uy
+        for ox, oy, orr in obstacles:
+            clear = min(clear, math.hypot(fx - ox, fy - oy) - orr - finger_w / 2)
+        for w in walls:
+            clear = min(clear, _seg_dist(fx, fy, *w) - finger_w / 2)
+    return clear
+
+
 def best_jaw_yaw(x, y, apple_r, open_w, finger_w, obstacles, walls):
     """집게 두 손가락이 내려앉을 자리의 여유가 가장 큰 방향(rad)과 그 여유(m).
     obstacles: [(x, y, r)] 이웃 사과, walls: [(x1, y1, x2, y2)] 트레이 안쪽 벽 선분."""
-    def seg_dist(px, py, x1, y1, x2, y2):
-        dx, dy = x2 - x1, y2 - y1
-        t = max(0.0, min(1.0, ((px - x1) * dx + (py - y1) * dy) / (dx * dx + dy * dy or 1e-12)))
-        return math.hypot(px - (x1 + t * dx), py - (y1 + t * dy))
     best = None
-    d = open_w / 2 + finger_w / 2            # 손가락 중심까지 거리
     for k in range(36):
         th = math.pi * k / 36
-        ux, uy = math.cos(th), math.sin(th)
-        clear = 1.0
-        for sgn in (1, -1):
-            fx, fy = x + sgn * d * ux, y + sgn * d * uy
-            for ox, oy, orr in obstacles:
-                clear = min(clear, math.hypot(fx - ox, fy - oy) - orr - finger_w / 2)
-            for w in walls:
-                clear = min(clear, seg_dist(fx, fy, *w) - finger_w / 2)
+        clear = jaw_clearance(th, x, y, open_w, finger_w, obstacles, walls)
         if best is None or clear > best[1]:
             best = (th, clear)
     return best
+
+
+def wall_jaw_yaw(x, y, apple_r, open_w, finger_w, obstacles, walls, near_m, min_clear):
+    """벽에 붙은 사과의 집게 방향 — 벽을 보고 정한다. (방향 rad, 여유 m, 설명) 또는 None(가까운 벽 없음 / 안 됨).
+
+    - 벽 하나에 붙음(가로벽 / 세로벽): 집게가 벽과 나란히 닫히게 → 손가락이 사과 양옆(벽을 따라)으로 내려앉는다.
+      가로벽이면 손가락이 세로로 서고, 세로벽이면 가로로 선다. 벽과 사과 사이에 손가락을 넣지 않는다
+    - 모서리(두 벽)거나, 벽과 나란히는 이웃 사과에 걸리면: 대각선(벽에서 ±45°) 중 자리가 있는 쪽
+    - 어느 것도 min_clear 이상 여유가 없으면 None (기존처럼 굴리기 / 최대 여유 방향)"""
+    near = [w for w in walls if _seg_dist(x, y, *w) < apple_r + near_m]
+    if not near:
+        return None
+    dirs = []                                # 가까운 벽들의 방향 (0~180°, 거의 나란하면 하나로)
+    for x1, y1, x2, y2 in sorted(near, key=lambda w: _seg_dist(x, y, *w)):
+        a = math.atan2(y2 - y1, x2 - x1) % math.pi
+        if all(abs((a - b + math.pi / 2) % math.pi - math.pi / 2) > math.radians(20) for b in dirs):
+            dirs.append(a)
+    base = dirs[0]                           # 가장 가까운 벽 방향
+
+    def clr(th):
+        return jaw_clearance(th, x, y, open_w, finger_w, obstacles, walls)
+
+    if len(dirs) == 1:
+        c = clr(base)
+        if c >= min_clear:
+            return base, c, "벽과 나란히"
+    diag = max((base + math.pi / 4, base - math.pi / 4), key=clr)
+    c = clr(diag)
+    if c >= min_clear:
+        return diag, c, "대각선" + (" (모서리)" if len(dirs) > 1 else "")
+    return None
 
 
 class Mission:
@@ -223,10 +256,17 @@ class Mission:
         if ctx:   # 사과 크기를 알면 필요한 만큼만 연다 (지름 + 여유)
             open_w = min(open_w, 2 * ctx["r"] + float(g.get("open_margin_m", 0.02)))
         if ctx and g.get("auto_jaw", True):
-            th, clear = best_jaw_yaw(ax, ay, ctx["r"], open_w, g["finger_width_m"],
-                                     ctx["others"], ctx["walls"])
+            # 벽에 붙었으면 벽을 보고 돌려 잡는다: 벽과 나란히(가로벽 → 세로, 세로벽 → 가로), 모서리·애매하면 대각선
+            wj = wall_jaw_yaw(ax, ay, ctx["r"], open_w, g["finger_width_m"], ctx["others"], ctx["walls"],
+                              float(g.get("wall_near_m", 0.015)), float(g.get("wall_min_clear_m", 0.003)))
+            if wj:
+                th, clear, how = wj
+                log.info("벽에 붙은 사과 — 집게를 %s으로 돌려 잡는다", how)
+            else:
+                th, clear = best_jaw_yaw(ax, ay, ctx["r"], open_w, g["finger_width_m"],
+                                         ctx["others"], ctx["walls"])
             nd = c.get("nudge", {})
-            if nd.get("enabled", True) and clear < nd.get("min_clearance_m", 0.010) and self._nudges < nd.get("max_per_apple", 2):
+            if not wj and nd.get("enabled", True) and clear < nd.get("min_clearance_m", 0.010) and self._nudges < nd.get("max_per_apple", 2):
                 log.warning("손가락 여유 %.0fmm — 벽에 붙은 사과. 가운데로 살짝 굴린 뒤 다시 집는다", clear * 1000)
                 self._nudge(ax, ay, ctx)
                 raise NeedRedetect()
