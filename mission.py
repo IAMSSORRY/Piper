@@ -221,14 +221,25 @@ def wall_jaw_yaw(x, y, apple_r, open_w, finger_w, obstacles, walls, near_m, min_
     def clr(th):
         return jaw_clearance(th, x, y, open_w, finger_w, obstacles, walls)
 
-    if len(dirs) == 1:
-        c = clr(base)
-        if c >= min_clear:
-            return base, c, "벽과 나란히"
+    if len(dirs) > 1:
+        # 모서리: 집게를 모서리를 가리키는 대각선으로 — 한 손가락은 모서리 쪽 삼각형 틈에, 다른 손가락은 트레이 안쪽에.
+        # 둥근 사과와 모서리 사이 틈은 손가락 원 모델보다 넓다 (판 모양 손가락이 모서리 삼각형에 들어간다) → 여유와 상관없이 이 방향
+        vx = vy = 0.0
+        for x1, y1, x2, y2 in near:              # 사과 → 각 벽의 가장 가까운 점 (= 모서리 쪽)
+            dx, dy = x2 - x1, y2 - y1
+            t = max(0.0, min(1.0, ((x - x1) * dx + (y - y1) * dy) / (dx * dx + dy * dy or 1e-12)))
+            px, py = x1 + t * dx - x, y1 + t * dy - y
+            n = math.hypot(px, py) or 1.0
+            vx, vy = vx + px / n, vy + py / n
+        th = math.atan2(vy, vx) % math.pi
+        return th, clr(th), "대각선 (모서리)"
+    c = clr(base)
+    if c >= min_clear:
+        return base, c, "벽과 나란히"
     diag = max((base + math.pi / 4, base - math.pi / 4), key=clr)
     c = clr(diag)
     if c >= min_clear:
-        return diag, c, "대각선" + (" (모서리)" if len(dirs) > 1 else "")
+        return diag, c, "대각선"
     return None
 
 
@@ -251,6 +262,7 @@ class Mission:
         x, y = x + ox, y + oy
         ctx = getattr(self.sig, "grasp_context", lambda: None)()
         self.r.jaw_yaw = None
+        corner = False
         g = c["gripper"]
         open_w = float(g["open_width_m"])
         if ctx:   # 사과 크기를 알면 필요한 만큼만 연다 (지름 + 여유)
@@ -259,7 +271,13 @@ class Mission:
             # 벽에 붙었으면 벽을 보고 돌려 잡는다: 벽과 나란히(가로벽 → 세로, 세로벽 → 가로), 모서리·애매하면 대각선
             wj = wall_jaw_yaw(ax, ay, ctx["r"], open_w, g["finger_width_m"], ctx["others"], ctx["walls"],
                               float(g.get("wall_near_m", 0.015)), float(g.get("wall_min_clear_m", 0.003)))
-            if wj:
+            if wj and "모서리" in wj[2]:
+                # 모서리: 사과 지름 + 조금만 벌려 모서리 쪽 손가락이 틈에 들어가게. 내려가다 닿으면 거기서 멈추고 잡는다
+                open_w = min(open_w, 2 * ctx["r"] + float(g.get("corner_open_margin_m", 0.006)))
+                corner = True
+                th, clear, how = wj
+                log.warning("모서리 사과 — 집게를 대각선 %.0f° 로, %.0fmm 만 벌려 잡는다", math.degrees(th), open_w * 1000)
+            elif wj:
                 th, clear, how = wj
                 log.info("벽에 붙은 사과 — 집게를 %s으로 돌려 잡는다", how)
             else:
@@ -282,7 +300,12 @@ class Mission:
         self.r.transit_to(x, y, c["motion"]["transit_speed_pct"])
         self.r.grip(True, width=open_w)
         self.r.down_to(x, y, z_app, c["motion"]["approach_speed_pct"])
-        self.r.down_to(x, y, z_grasp, self.tuner.speed(p["descend_speed_pct"]))   # 잡기 직전만 느리게
+        if corner:   # 모서리: 손가락이 벽 위·사과 위에 걸리면 누르지 말고 거기서 멈춰 잡는다
+            how_d, _ = self.r.guarded_down(x, y, z_grasp, self.tuner.speed(p["descend_speed_pct"]), p.get("contact_nm", 0.5))
+            if how_d == "contact":
+                log.warning("모서리 잡기 하강 중 닿음 — 그 높이에서 잡는다")
+        else:
+            self.r.down_to(x, y, z_grasp, self.tuner.speed(p["descend_speed_pct"]))   # 잡기 직전만 느리게
         w = self.r.grip(False)
         min_w = c["gripper"]["min_grasp_width_m"]
         ok = w >= min_w
